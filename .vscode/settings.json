@@ -1,0 +1,36 @@
+{
+  "debug.javascript.autoAttachFilter": "smart",
+  "editor.formatOnSave": true,
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/*.pyc": true,
+    "**/node_modules": true
+  },
+  "cSpell.words": [
+    "Avenir",
+    "beatgrid",
+    "beatgrids",
+    "CRSS",
+    "Crossfader",
+    "fflush",
+    "fputs",
+    "GEOB",
+    "IONBF",
+    "lede",
+    "LOCALAPPDATA",
+    "Mgmt",
+    "mtimes",
+    "NOCASE",
+    "Playhead",
+    "remixer",
+    "scrate",
+    "setvbuf",
+    "swiftc",
+    "synchsafe",
+    "timetag",
+    "Upfader",
+    "upfaders",
+    "userio",
+    "whitelabel"
+  ]
+}
