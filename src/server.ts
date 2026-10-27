@@ -155,7 +155,7 @@ export async function start(options?: {
         body.bpm,
         body.sidecar,
         body.error ?? '',
-        body.matches.map((match) => [match.source, match.track_id, match.filepath, match.reasons, match.note]),
+        body.matches.map((match) => [match.source, match.track_id, match.filepath, match.reasons, match.note, match.rating]),
       ]);
       if (relatedKeys.get(body.deck) === key) continue;
       relatedKeys.set(body.deck, key);

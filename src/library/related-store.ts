@@ -1,176 +1,137 @@
 /**
  * Read-only adapter for serato-library-manager's Related Tracks sidecar.
  *
- * The library manager is adding `docs/related-tracks.md`. Until that file
- * is merged, this module is the only place that knows where the sidecar
- * lives and which tables it accepts. Callers ask for saved matches. They
- * do not open the database themselves.
+ * The file is `related.sqlite` in the library manager's settings directory:
+ * macOS `~/Library/Application Support/Serato Library`, Windows
+ * `%APPDATA%\Serato Library`, Linux `$XDG_CONFIG_HOME/serato-library` or
+ * `~/.config/serato-library`. `SERATO_RELATED_PATH` replaces that file.
+ * `SERATO_LIBRARY_CONFIG_DIR` replaces the directory when it is absolute.
  *
- * The file sits beside `master.sqlite` and is named `related-tracks.sqlite`,
- * or `related_tracks.sqlite` when only that name is present.
- * `SERATO_RELATED_PATH` replaces that location. A missing file, a database
- * without a recognized table, or a file that cannot be read yields no saved
- * matches. The connection is read-only and closed before this module returns.
- *
- * Canonical table:
- *
- * ```sql
- * CREATE TABLE related_track (
- *   id INTEGER PRIMARY KEY,
- *   asset_id INTEGER,
- *   related_asset_id INTEGER,
- *   portable_id TEXT,
- *   related_portable_id TEXT,
- *   note TEXT,
- *   position INTEGER
- * );
- * ```
- *
- * A row is undirected. `position` orders the matches, lowest first.
- * `track_relation` (`left_asset_id`, `right_asset_id`) and a few other
- * names are accepted so a nearby schema still loads. Anything else is
- * reported as `schema` and ignored.
+ * Schema version 1 (`PRAGMA user_version`) has `track` and `link`. A link is
+ * one direction. `mutual = 1` is visible from both ends. The playing track is
+ * matched by canonical path, then by a unique case-insensitive path, then by
+ * a unique title, artist, and length in whole seconds. This module never
+ * writes the file, including when a fallback row still points at another copy.
  */
 
-import { createRequire } from 'node:module';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
-import type { DatabaseSync, SQLOutputValue } from 'node:sqlite';
+import { DatabaseSync, type SQLOutputValue } from 'node:sqlite';
 
-const nodeRequire = createRequire(__filename);
+/** Sidecar schema this reader understands. Anything else is left unread. */
+export const RELATED_SCHEMA_VERSION = 1;
 
-/** DDL for the canonical `related_track` table. Tests build the sidecar from this. */
-export const RELATED_TRACK_DDL = `
-CREATE TABLE related_track (
-  id INTEGER PRIMARY KEY,
-  asset_id INTEGER,
-  related_asset_id INTEGER,
-  portable_id TEXT,
-  related_portable_id TEXT,
-  note TEXT,
-  position INTEGER
-)`;
+/** Filename inside the library manager's settings directory. */
+export const RELATED_DB_NAME = 'related.sqlite';
 
-/** File names checked beside `master.sqlite`, in preference order. */
-export const SIDECAR_NAMES = ['related-tracks.sqlite', 'related_tracks.sqlite'] as const;
+/** Longest path the library manager stores. Longer values do not match. */
+const PATH_LIMIT = 4096;
 
 /**
- * Why saved matches are empty or present.
- * `ok` means the sidecar opened and had a recognized table.
- * `missing` means the file is not there. `schema` means it opened but no
- * table had a source and a target. `unavailable` means it could not be read.
+ * Tables for schema version 1.
+ * Tests set `PRAGMA user_version` themselves. The reader does not.
  */
+export const RELATED_SCHEMA_SQL = `
+CREATE TABLE track (
+  id INTEGER PRIMARY KEY,
+  path TEXT NOT NULL,
+  title TEXT NOT NULL DEFAULT '',
+  artist TEXT NOT NULL DEFAULT '',
+  length_ms INTEGER,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX track_path ON track(path);
+CREATE INDEX track_fallback ON track(title, artist, length_ms);
+CREATE TABLE link (
+  id INTEGER PRIMARY KEY,
+  from_track_id INTEGER NOT NULL,
+  to_track_id INTEGER NOT NULL,
+  mutual INTEGER NOT NULL DEFAULT 0 CHECK (mutual IN (0, 1)),
+  note TEXT NOT NULL DEFAULT '',
+  rating INTEGER CHECK (rating IS NULL OR (rating BETWEEN 1 AND 5)),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK (from_track_id != to_track_id),
+  UNIQUE (from_track_id, to_track_id)
+);
+CREATE INDEX link_from ON link(from_track_id);
+CREATE INDEX link_to ON link(to_track_id);
+`;
+
+/** Why saved matches are present or empty. */
 export type SidecarStatus = 'ok' | 'missing' | 'schema' | 'unavailable';
 
-/** One saved relation, before it is filled in from the Serato library. */
-export interface SavedMatch {
-  assetId: number | null;
-  portableId: string | null;
-  note: string | null;
-  position: number | null;
-}
-
-/** The playing track the sidecar is searched with. */
-export interface RelationLookup {
-  assetId: number | null;
+/** One library track, used to reject a fallback that still names another copy. */
+export interface LibraryIdentity {
+  id: number;
   paths: string[];
 }
 
-/** An open sidecar's rows, already read, so the file handle is not kept. */
+/** The playing track, as the live deck and the open library describe it. */
+export interface RelationLookup {
+  paths: string[];
+  title: string;
+  artist: string;
+  lengthMs: number | null;
+  anchorId: number | null;
+  library: LibraryIdentity[];
+}
+
+/** One saved relation, already filtered to the direction the playing track can see. */
+export interface SavedMatch {
+  path: string;
+  title: string;
+  artist: string;
+  lengthMs: number | null;
+  note: string | null;
+  rating: number | null;
+  mutual: boolean;
+}
+
+/** Sidecar contents needed to answer one or more deck lookups. */
 export interface SidecarSnapshot {
   status: SidecarStatus;
-  /**
-   * Returns saved matches for one playing track.
-   *
-   * @param lookup Asset id and file paths of the playing track.
-   * @returns Matches in sidecar order. Empty when the sidecar has no rows.
-   *
-   * Side effects: none.
-   */
   matchesFor(lookup: RelationLookup): SavedMatch[];
 }
 
-/** Tables accepted as the relations list, most specific first. */
-const TABLE_CANDIDATES = [
-  'related_track',
-  'related_tracks',
-  'track_relation',
-  'track_relations',
-  'related',
-  'relation',
-  'relations',
-];
-
-/** Column names that identify the row's first track. */
-const SOURCE_ID_COLUMNS = ['asset_id', 'source_asset_id', 'from_asset_id', 'left_asset_id', 'track_id', 'track_a'];
-
-/** Column names that identify the row's other track. */
-const TARGET_ID_COLUMNS = [
-  'related_asset_id',
-  'target_asset_id',
-  'to_asset_id',
-  'right_asset_id',
-  'match_asset_id',
-  'related_track_id',
-  'related_id',
-  'track_b',
-];
-
-/** Column names that store the first track's path. */
-const SOURCE_PATH_COLUMNS = [
-  'portable_id',
-  'source_portable_id',
-  'from_portable_id',
-  'source_path',
-  'filepath',
-  'left_portable_id',
-  'path',
-];
-
-/** Column names that store the other track's path. */
-const TARGET_PATH_COLUMNS = [
-  'related_portable_id',
-  'target_portable_id',
-  'to_portable_id',
-  'related_path',
-  'match_path',
-  'right_portable_id',
-];
-
-const NOTE_COLUMNS = ['note', 'comment', 'reason'];
-const POSITION_COLUMNS = ['position', 'list_order', 'rank', 'sort_order'];
-
-interface ColumnMap {
-  table: string;
-  sourceId?: string;
-  targetId?: string;
-  sourcePath?: string;
-  targetPath?: string;
-  note?: string;
-  position?: string;
-  id?: string;
+interface StoredTrack {
+  id: number;
+  path: string;
+  title: string;
+  artist: string;
+  lengthMs: number | null;
 }
 
-interface StoredRow {
-  rowId: number | null;
-  leftId: number | null;
-  rightId: number | null;
-  leftPath: string | null;
-  rightPath: string | null;
+interface StoredLink {
+  id: number;
+  fromId: number;
+  toId: number;
+  mutual: boolean;
   note: string | null;
-  position: number | null;
+  rating: number | null;
 }
 
 interface LoadedSidecar {
   status: SidecarStatus;
-  rows: StoredRow[];
+  tracks: StoredTrack[];
+  links: StoredLink[];
+}
+
+/** Options for {@link defaultRelatedPath}. Omitted fields follow this process. */
+export interface RelatedPathOptions {
+  platform?: NodeJS.Platform;
+  home?: string;
+  appData?: string | null;
+  xdgConfigHome?: string | null;
 }
 
 let pathOverride: string | null = null;
 
 /**
  * Points related-track reads at one sidecar for a test.
- * Pass null to follow `SERATO_RELATED_PATH` or the file beside the master database.
+ * Pass null to follow `SERATO_RELATED_PATH` or the settings directory.
  *
  * @param next Sidecar path, or null to clear the override.
  *
@@ -181,30 +142,85 @@ export function setRelatedPathForTests(next: string | null): void {
 }
 
 /**
- * Returns the sidecar path for a master database.
- * A test override wins, then `SERATO_RELATED_PATH`, then the first existing
- * candidate beside the master file. When none of those files exist, the
- * canonical name is returned so the caller can report it as missing.
+ * Returns the sidecar path for this platform's settings directory.
  *
- * @param masterFile Path of `master.sqlite`. It is not opened.
+ * @param options Platform, home, and config roots. Defaults follow the process.
+ * @returns `related.sqlite` under the library manager's settings directory.
+ *
+ * Side effects: none.
+ */
+export function defaultRelatedPath(options: RelatedPathOptions = {}): string {
+  const platform = options.platform ?? process.platform;
+  const home = options.home ?? os.homedir();
+  const join = platform === 'win32' ? path.win32.join : path.posix.join;
+  if (platform === 'darwin') {
+    return join(home, 'Library', 'Application Support', 'Serato Library', RELATED_DB_NAME);
+  }
+  if (platform === 'win32') {
+    const appData =
+      options.appData !== undefined ? options.appData : options.platform ? null : (process.env.APPDATA ?? null);
+    const base = appData && appData.trim() ? appData.trim() : join(home, 'AppData', 'Roaming');
+    return join(base, 'Serato Library', RELATED_DB_NAME);
+  }
+  const xdg =
+    options.xdgConfigHome !== undefined ? options.xdgConfigHome : options.platform ? null : (process.env.XDG_CONFIG_HOME ?? null);
+  const base = xdg && xdg.trim() ? xdg.trim() : join(home, '.config');
+  return join(base, 'serato-library', RELATED_DB_NAME);
+}
+
+/**
+ * Returns the sidecar path the process would open.
+ * A test override wins, then `SERATO_RELATED_PATH`, then an absolute
+ * `SERATO_LIBRARY_CONFIG_DIR`, then the platform settings directory.
+ *
  * @returns The sidecar path. The file may not exist.
  *
- * Side effects: checks whether candidate files exist.
+ * Side effects: reads environment variables. Does not open a database.
  */
-export function sidecarPath(masterFile: string): string {
+export function sidecarPath(): string {
   if (pathOverride) return pathOverride;
   const fromEnv = process.env.SERATO_RELATED_PATH;
   if (fromEnv && fromEnv.trim()) return fromEnv.trim();
-  const dir = path.dirname(path.resolve(masterFile));
-  for (const name of SIDECAR_NAMES) {
-    const candidate = path.join(dir, name);
-    try {
-      if (fs.existsSync(candidate)) return candidate;
-    } catch {
-      // A path the process cannot stat is skipped.
+  const configDir = process.env.SERATO_LIBRARY_CONFIG_DIR;
+  if (configDir && configDir.trim() && path.isAbsolute(configDir.trim())) {
+    return path.join(configDir.trim(), RELATED_DB_NAME);
+  }
+  return defaultRelatedPath();
+}
+
+/**
+ * Canonical path used as the sidecar's primary key.
+ * Empty values, NUL, and paths longer than 4096 characters do not match.
+ * A relative path is the home copy when that file exists, otherwise the
+ * filesystem-root copy when that exists, otherwise the home copy.
+ *
+ * @param value A live path, a portable id, or a path stored in the sidecar.
+ * @returns The canonical path, or null when the value cannot be a key.
+ *
+ * Side effects: stats the path and its parent when resolving a relative path.
+ */
+export function identityPath(value: string | null | undefined): string | null {
+  if (value == null) return null;
+  const text = value.trim();
+  if (!text || text.includes('\0') || text.length > PATH_LIMIT) return null;
+  const expanded = expandHome(text);
+  let chosen = expanded;
+  if (!path.isAbsolute(expanded)) {
+    const homeCandidate = path.join(os.homedir(), expanded);
+    const rootCandidate = path.join(path.parse(os.homedir()).root, expanded);
+    chosen = homeCandidate;
+    for (const candidate of [homeCandidate, rootCandidate]) {
+      try {
+        if (fs.existsSync(candidate)) {
+          chosen = candidate;
+          break;
+        }
+      } catch {
+        // An unreadable candidate is skipped.
+      }
     }
   }
-  return path.join(dir, SIDECAR_NAMES[0]);
+  return resolveLoose(chosen);
 }
 
 /**
@@ -227,351 +243,317 @@ export function sameTrackPath(left: string, right: string): boolean {
 
 /**
  * Reads the sidecar once and closes it.
- * Later `matchesFor` calls filter the rows already in memory.
+ * Later `matchesFor` calls use the rows already in memory.
  *
  * @param file Sidecar path from `sidecarPath`.
- * @returns The status and a matcher. The matcher returns an empty list when nothing was stored.
+ * @returns The status and a matcher. The matcher returns an empty list unless the schema version is 1.
  *
- * Side effects: opens and closes `file` when it exists.
+ * Side effects: opens and closes `file` when it exists. Does not create it.
  */
 export function openSidecar(file: string): SidecarSnapshot {
   const loaded = loadSidecar(file);
   return {
     status: loaded.status,
     /**
-     * Filters the loaded rows for one playing track.
+     * Returns saved links visible from one playing track.
      *
-     * @param lookup Asset id and paths of the playing track.
-     * @returns Saved matches in position order.
+     * @param lookup Paths, title, artist, length, and the open library.
+     * @returns Matches in link-id order.
      *
      * Side effects: none.
      */
     matchesFor(lookup: RelationLookup): SavedMatch[] {
-      return filterSaved(loaded.rows, lookup);
+      if (loaded.status !== 'ok') return [];
+      const anchor = anchorTrackId(loaded.tracks, lookup);
+      if (anchor == null) return [];
+      const tracks = new Map(loaded.tracks.map((track) => [track.id, track]));
+      const matches: SavedMatch[] = [];
+      for (const link of loaded.links) {
+        if (link.fromId !== anchor && !(link.mutual && link.toId === anchor)) continue;
+        const otherId = link.fromId === anchor ? link.toId : link.fromId;
+        const other = tracks.get(otherId);
+        if (!other) continue;
+        matches.push({
+          path: other.path,
+          title: other.title,
+          artist: other.artist,
+          lengthMs: other.lengthMs,
+          note: link.note,
+          rating: link.rating,
+          mutual: link.mutual,
+        });
+      }
+      return matches;
     },
   };
 }
 
 /**
- * Lowers a path and turns backslashes into slashes.
+ * Opens the sidecar read-only when it is schema version 1.
  *
- * @param value A file path.
- * @returns The comparable form, without a trailing slash.
+ * @param file Sidecar path.
+ * @returns Tracks and links, or a status that means no saved matches.
+ *
+ * Side effects: opens and closes `file`. Does not create or modify it.
+ */
+function loadSidecar(file: string): LoadedSidecar {
+  const empty = (status: SidecarStatus): LoadedSidecar => ({ status, tracks: [], links: [] });
+  if (!file) return empty('missing');
+  let exists = false;
+  try {
+    exists = fs.existsSync(file);
+  } catch {
+    return empty('unavailable');
+  }
+  if (!exists) return empty('missing');
+  let db: DatabaseSync | null = null;
+  try {
+    db = new DatabaseSync(file, { readOnly: true, timeout: 0 });
+    db.exec('PRAGMA query_only = ON');
+    const versionRow = db.prepare('PRAGMA user_version').get() as { user_version?: SQLOutputValue } | undefined;
+    const version = asInt(versionRow?.user_version);
+    if (version !== RELATED_SCHEMA_VERSION) return empty('schema');
+    const tracks = db
+      .prepare('SELECT id, path, title, artist, length_ms FROM track')
+      .all()
+      .map((row) => readTrack(row as Record<string, SQLOutputValue>))
+      .filter((track): track is StoredTrack => track != null);
+    const links = db
+      .prepare('SELECT id, from_track_id, to_track_id, mutual, note, rating FROM link ORDER BY id')
+      .all()
+      .map((row) => readLink(row as Record<string, SQLOutputValue>))
+      .filter((link): link is StoredLink => link != null);
+    return { status: 'ok', tracks, links };
+  } catch {
+    return empty('unavailable');
+  } finally {
+    db?.close();
+  }
+}
+
+/**
+ * Finds the sidecar row for the playing track.
+ * Path wins. A unique title, artist, and whole-second length is used only
+ * when no path matches, and only when that row is not another library track.
+ *
+ * @param tracks Sidecar tracks.
+ * @param lookup Playing track.
+ * @returns Sidecar track id, or null when nothing matches.
+ *
+ * Side effects: none.
+ */
+function anchorTrackId(tracks: StoredTrack[], lookup: RelationLookup): number | null {
+  const seen = new Set<string>();
+  for (const file of lookup.paths) {
+    const key = identityPath(file);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    const found = trackByPath(tracks, key);
+    if (found) return found.id;
+  }
+  const fallback = fallbackTrack(tracks, lookup);
+  if (!fallback || secondCopy(fallback.path, lookup)) return null;
+  return fallback.id;
+}
+
+/**
+ * Matches a canonical path, then a unique case-insensitive path.
+ *
+ * @param tracks Sidecar tracks.
+ * @param key Canonical path.
+ * @returns The one matching track, or null.
+ *
+ * Side effects: none.
+ */
+function trackByPath(tracks: StoredTrack[], key: string): StoredTrack | null {
+  const exact = tracks.find((track) => track.path === key);
+  if (exact) return exact;
+  const folded = key.toLowerCase();
+  const hits = tracks.filter((track) => track.path.toLowerCase() === folded);
+  return hits.length === 1 ? hits[0] : null;
+}
+
+/**
+ * Matches title, artist, and length in whole seconds when exactly one row fits.
+ *
+ * @param tracks Sidecar tracks.
+ * @param lookup Playing track. Length must be known.
+ * @returns The one matching track, or null.
+ *
+ * Side effects: none.
+ */
+function fallbackTrack(tracks: StoredTrack[], lookup: RelationLookup): StoredTrack | null {
+  const title = lookup.title.trim().toLowerCase();
+  const artist = lookup.artist.trim().toLowerCase();
+  if (!title || !artist || lookup.lengthMs == null || !Number.isFinite(lookup.lengthMs)) return null;
+  const seconds = Math.trunc(lookup.lengthMs / 1000);
+  const hits = tracks.filter((track) => {
+    if (track.lengthMs == null) return false;
+    return (
+      track.title.trim().toLowerCase() === title &&
+      track.artist.trim().toLowerCase() === artist &&
+      Math.trunc(track.lengthMs / 1000) === seconds
+    );
+  });
+  return hits.length === 1 ? hits[0] : null;
+}
+
+/**
+ * Returns whether a fallback row's stored path is a different track in the open library.
+ * The listener does not rewrite that path.
+ *
+ * @param stored Path stored on the fallback row.
+ * @param lookup Open library and the playing track's asset id.
+ * @returns True when the row should not be used.
+ *
+ * Side effects: none.
+ */
+function secondCopy(stored: string, lookup: RelationLookup): boolean {
+  const hit = libraryHit(stored, lookup.library);
+  if (!hit) return false;
+  return lookup.anchorId == null || hit.id !== lookup.anchorId;
+}
+
+/**
+ * Finds the library track named by a sidecar path.
+ * An exact path or portable id wins. Otherwise the first case-insensitive path wins.
+ *
+ * @param stored Path stored in the sidecar.
+ * @param library Tracks in the open library.
+ * @returns The library track, or null.
+ *
+ * Side effects: none.
+ */
+function libraryHit(stored: string, library: LibraryIdentity[]): LibraryIdentity | null {
+  const wanted = identityPath(stored);
+  const raw = stored.trim();
+  for (const track of library) {
+    for (const file of track.paths) {
+      if (!file) continue;
+      if (file === raw || (wanted != null && file === wanted)) return track;
+    }
+  }
+  if (!wanted) return null;
+  const folded = wanted.toLowerCase();
+  for (const track of library) {
+    for (const file of track.paths) {
+      if (file && file.toLowerCase() === folded) return track;
+    }
+  }
+  return null;
+}
+
+/**
+ * Reads one track row. A blank path is dropped.
+ *
+ * @param row Columns from `track`.
+ * @returns The stored track, or null.
+ *
+ * Side effects: none.
+ */
+function readTrack(row: Record<string, SQLOutputValue>): StoredTrack | null {
+  const id = asInt(row.id);
+  const stored = typeof row.path === 'string' ? row.path : '';
+  if (id == null || !stored) return null;
+  return {
+    id,
+    path: stored,
+    title: typeof row.title === 'string' ? row.title : '',
+    artist: typeof row.artist === 'string' ? row.artist : '',
+    lengthMs: asInt(row.length_ms),
+  };
+}
+
+/**
+ * Reads one link row. A rating outside 1 through 5 becomes null.
+ *
+ * @param row Columns from `link`.
+ * @returns The stored link, or null.
+ *
+ * Side effects: none.
+ */
+function readLink(row: Record<string, SQLOutputValue>): StoredLink | null {
+  const id = asInt(row.id);
+  const fromId = asInt(row.from_track_id);
+  const toId = asInt(row.to_track_id);
+  if (id == null || fromId == null || toId == null) return null;
+  const rating = asInt(row.rating);
+  const note = typeof row.note === 'string' ? row.note.trim() : '';
+  return {
+    id,
+    fromId,
+    toId,
+    mutual: asInt(row.mutual) === 1,
+    note: note || null,
+    rating: rating != null && rating >= 1 && rating <= 5 ? rating : null,
+  };
+}
+
+/**
+ * Expands a leading `~` to the home directory.
+ *
+ * @param text Path text, already trimmed.
+ * @returns The path with a leading home marker expanded.
+ *
+ * Side effects: none.
+ */
+function expandHome(text: string): string {
+  if (text === '~') return os.homedir();
+  if (text.startsWith('~/') || text.startsWith('~\\')) return path.join(os.homedir(), text.slice(2));
+  return text;
+}
+
+/**
+ * Resolves `.`, `..`, and an existing symlink prefix.
+ * A missing file keeps its resolved parent.
+ *
+ * @param file Absolute or relative path.
+ * @returns The resolved path.
+ *
+ * Side effects: stats the path and its ancestors.
+ */
+function resolveLoose(file: string): string {
+  const absolute = path.resolve(file);
+  const tail: string[] = [];
+  let current = absolute;
+  for (;;) {
+    try {
+      if (fs.existsSync(current)) return path.join(fs.realpathSync(current), ...tail);
+    } catch {
+      // An unreadable ancestor is left unresolved.
+    }
+    const parent = path.dirname(current);
+    if (parent === current) return path.join(current, ...tail);
+    tail.unshift(path.basename(current));
+    current = parent;
+  }
+}
+
+/**
+ * Normalizes a path for comparison.
+ *
+ * @param value File path or portable id.
+ * @returns Lowercase path with forward slashes, or an empty string.
  *
  * Side effects: none.
  */
 function normalizeTrackPath(value: string): string {
-  return value.replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/+$/u, '').toLowerCase();
+  return value.trim().replace(/\\/g, '/').replace(/\/+/g, '/').toLowerCase();
 }
 
 /**
- * Opens the sidecar, or reports why it could not be used.
+ * Reads an integer cell. Non-integers are dropped.
  *
- * @param file Sidecar path.
- * @returns Rows from the first recognized table, and the status.
- *
- * Side effects: opens and closes `file` when it exists.
- */
-function loadSidecar(file: string): LoadedSidecar {
-  let stat: fs.Stats;
-  try {
-    stat = fs.statSync(file);
-  } catch {
-    return { status: 'missing', rows: [] };
-  }
-  if (!stat.isFile()) return { status: 'unavailable', rows: [] };
-  let db: DatabaseSync;
-  try {
-    db = openReadOnly(file);
-  } catch {
-    return { status: 'unavailable', rows: [] };
-  }
-  try {
-    const names = tableNames(db);
-    for (const candidate of TABLE_CANDIDATES) {
-      const actual = names.get(candidate);
-      if (!actual) continue;
-      const columns = columnMap(db, actual);
-      if (!columns) continue;
-      return { status: 'ok', rows: readRows(db, columns) };
-    }
-    return { status: 'schema', rows: [] };
-  } catch {
-    return { status: 'unavailable', rows: [] };
-  } finally {
-    db.close();
-  }
-}
-
-/**
- * Opens a sidecar without allowing writes.
- *
- * @param file Existing database file.
- * @returns A read-only connection. The caller closes it.
- *
- * Side effects: opens a file handle.
- */
-function openReadOnly(file: string): DatabaseSync {
-  const { DatabaseSync } = nodeRequire('node:sqlite') as typeof import('node:sqlite');
-  const db = new DatabaseSync(file, {
-    readOnly: true,
-    timeout: 0,
-    enableForeignKeyConstraints: false,
-    readBigInts: false,
-  });
-  try {
-    db.exec('PRAGMA query_only=ON');
-  } catch (err) {
-    db.close();
-    throw err;
-  }
-  return db;
-}
-
-/**
- * Lists user tables by their lower-case name.
- *
- * @param db Open sidecar.
- * @returns Actual table names keyed by lower-case name.
- *
- * Side effects: reads `sqlite_master`.
- */
-function tableNames(db: DatabaseSync): Map<string, string> {
-  const rows = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name?: SQLOutputValue }>;
-  const names = new Map<string, string>();
-  for (const row of rows) {
-    const name = cellText(row.name);
-    if (name) names.set(name.toLowerCase(), name);
-  }
-  return names;
-}
-
-/**
- * Finds a source and a target column on one table.
- *
- * @param db Open sidecar.
- * @param table Table name as stored in `sqlite_master`.
- * @returns The columns to read, or null when the table cannot describe a pair.
- *
- * Side effects: reads `PRAGMA table_info`.
- */
-function columnMap(db: DatabaseSync, table: string): ColumnMap | null {
-  if (!isIdent(table)) return null;
-  const rows = db.prepare(`PRAGMA table_info(${quoteIdent(table)})`).all() as Array<{ name?: SQLOutputValue }>;
-  const columns = new Map<string, string>();
-  for (const row of rows) {
-    const name = cellText(row.name);
-    if (name && isIdent(name)) columns.set(name.toLowerCase(), name);
-  }
-  const sourceId = pick(columns, SOURCE_ID_COLUMNS);
-  const targetId = pick(columns, TARGET_ID_COLUMNS);
-  const sourcePath = pick(columns, SOURCE_PATH_COLUMNS);
-  const targetPath = pick(columns, TARGET_PATH_COLUMNS);
-  if (!sourceId && !sourcePath) return null;
-  if (!targetId && !targetPath) return null;
-  return {
-    table,
-    sourceId,
-    targetId,
-    sourcePath,
-    targetPath,
-    note: pick(columns, NOTE_COLUMNS),
-    position: pick(columns, POSITION_COLUMNS),
-    id: columns.get('id'),
-  };
-}
-
-/**
- * Reads every relation row.
- * `rowid` supplies order when the table has no `id` column. A table without
- * `rowid` is read again without that column.
- *
- * @param db Open sidecar.
- * @param columns Mapped columns.
- * @returns The stored rows. Order is not significant yet.
- *
- * Side effects: reads the relation table.
- */
-function readRows(db: DatabaseSync, columns: ColumnMap): StoredRow[] {
-  const sqlFor = (includeRowId: boolean): string => {
-    const rowId = includeRowId ? 'rowid' : columns.id ? quoteIdent(columns.id) : 'NULL';
-    return `SELECT ${rowId} AS row_id, ${select(columns.sourceId, 'left_id')}, ${select(columns.targetId, 'right_id')}, ${select(columns.sourcePath, 'left_path')}, ${select(columns.targetPath, 'right_path')}, ${select(columns.note, 'note')}, ${select(columns.position, 'position')} FROM ${quoteIdent(columns.table)}`;
-  };
-  let rows: Record<string, SQLOutputValue>[];
-  try {
-    rows = db.prepare(sqlFor(true)).all() as unknown as Record<string, SQLOutputValue>[];
-  } catch {
-    rows = db.prepare(sqlFor(false)).all() as unknown as Record<string, SQLOutputValue>[];
-  }
-  return rows.map((record) => {
-    return {
-      rowId: cellId(record.row_id),
-      leftId: cellId(record.left_id),
-      rightId: cellId(record.right_id),
-      leftPath: cellText(record.left_path),
-      rightPath: cellText(record.right_path),
-      note: cellText(record.note),
-      position: cellNumber(record.position),
-    };
-  });
-}
-
-/**
- * Keeps rows that mention the playing track and returns the other side.
- *
- * @param rows Rows loaded from the sidecar.
- * @param lookup The playing track.
- * @returns Unique matches, saved order preserved.
+ * @param value Cell from `node:sqlite`.
+ * @returns The integer, or null.
  *
  * Side effects: none.
  */
-function filterSaved(rows: StoredRow[], lookup: RelationLookup): SavedMatch[] {
-  const found: Array<SavedMatch & { rowId: number | null }> = [];
-  for (const row of rows) {
-    const left = { assetId: row.leftId, portableId: row.leftPath };
-    const right = { assetId: row.rightId, portableId: row.rightPath };
-    const leftHit = identifies(left, lookup);
-    const rightHit = identifies(right, lookup);
-    if (leftHit === rightHit) continue;
-    const match = leftHit ? right : left;
-    if (match.assetId == null && !match.portableId) continue;
-    if (identifies(match, lookup)) continue;
-    found.push({ ...match, note: row.note, position: row.position, rowId: row.rowId });
+function asInt(value: SQLOutputValue | undefined): number | null {
+  if (typeof value === 'bigint') {
+    const numeric = Number(value);
+    return Number.isSafeInteger(numeric) ? numeric : null;
   }
-  found.sort((a, b) => {
-    const aMissing = a.position == null ? 1 : 0;
-    const bMissing = b.position == null ? 1 : 0;
-    if (aMissing !== bMissing) return aMissing - bMissing;
-    if (a.position != null && b.position != null && a.position !== b.position) return a.position - b.position;
-    return (a.rowId ?? Number.MAX_SAFE_INTEGER) - (b.rowId ?? Number.MAX_SAFE_INTEGER);
-  });
-  const seen = new Set<string>();
-  const matches: SavedMatch[] = [];
-  for (const match of found) {
-    const key = match.assetId != null ? `id:${match.assetId}` : `path:${normalizeTrackPath(match.portableId || '')}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    matches.push({
-      assetId: match.assetId,
-      portableId: match.portableId,
-      note: match.note,
-      position: match.position,
-    });
-  }
-  return matches;
-}
-
-/**
- * Returns whether one side of a row is the playing track.
- *
- * @param side Asset id and path stored on that side.
- * @param lookup The playing track.
- * @returns True when the id or the path matches.
- *
- * Side effects: none.
- */
-function identifies(side: { assetId: number | null; portableId: string | null }, lookup: RelationLookup): boolean {
-  if (lookup.assetId != null && side.assetId != null && lookup.assetId === side.assetId) return true;
-  if (!side.portableId) return false;
-  return lookup.paths.some((file) => file && sameTrackPath(file, side.portableId || ''));
-}
-
-/**
- * Picks the first listed column that the table has.
- *
- * @param columns Lower-case names mapped to the stored spelling.
- * @param names Candidate names, preferred first.
- * @returns The stored column name, or undefined.
- *
- * Side effects: none.
- */
-function pick(columns: Map<string, string>, names: string[]): string | undefined {
-  for (const name of names) {
-    const found = columns.get(name);
-    if (found) return found;
-  }
-  return undefined;
-}
-
-/**
- * Builds one select expression.
- *
- * @param column Stored column name, or undefined to select null.
- * @param alias Result name.
- * @returns SQL for that column.
- *
- * Side effects: none.
- */
-function select(column: string | undefined, alias: string): string {
-  if (!column) return `NULL AS ${alias}`;
-  return `${quoteIdent(column)} AS ${alias}`;
-}
-
-/**
- * Returns whether a name can be quoted as a SQLite identifier.
- *
- * @param name Table or column name.
- * @returns True for a plain identifier.
- *
- * Side effects: none.
- */
-function isIdent(name: string): boolean {
-  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(name);
-}
-
-/**
- * Quotes a SQLite identifier.
- *
- * @param name A name that `isIdent` already accepted.
- * @returns The quoted name.
- *
- * Side effects: none.
- */
-function quoteIdent(name: string): string {
-  return `"${name}"`;
-}
-
-/**
- * Returns a SQLite cell as text.
- *
- * @param value A cell value.
- * @returns The text, or null when it is empty.
- *
- * Side effects: none.
- */
-function cellText(value: SQLOutputValue | undefined): string | null {
-  if (typeof value === 'string') return value === '' ? null : value;
-  if (typeof value === 'number' || typeof value === 'bigint') return String(value);
-  return null;
-}
-
-/**
- * Returns a SQLite cell as a finite number.
- *
- * @param value A cell value.
- * @returns The number, or null.
- *
- * Side effects: none.
- */
-function cellNumber(value: SQLOutputValue | undefined): number | null {
-  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
-  if (typeof value === 'bigint') return Number(value);
-  if (typeof value === 'string' && value.trim() !== '') {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : null;
-  }
-  return null;
-}
-
-/**
- * Returns a SQLite cell as an integer id.
- *
- * @param value A cell value.
- * @returns The truncated id, or null.
- *
- * Side effects: none.
- */
-function cellId(value: SQLOutputValue | undefined): number | null {
-  const parsed = cellNumber(value);
-  return parsed == null ? null : Math.trunc(parsed);
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+  return Number.isInteger(value) ? value : null;
 }

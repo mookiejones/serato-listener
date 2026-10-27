@@ -105,6 +105,7 @@ function render() {
       if (match.key) bits.push(match.key);
       if (match.bpm) bits.push(String(match.bpm) + ' BPM');
       if (match.crates && match.crates.length) bits.push(match.crates.join(', '));
+      if (match.rating) bits.push(String(match.rating) + '/5');
       if (match.note) bits.push(match.note);
       if (bits.length) item.appendChild(el('div', 'meta', bits.join(' · ')));
       list.appendChild(item);
