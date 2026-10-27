@@ -2,13 +2,13 @@
   "name": "serato-listener",
   "private": true,
   "version": "0.1.0",
-  "description": "Local OSC interface for Serato DJ Pro, with read and crate edits of the on-disk library",
+  "description": "Local OSC and MIDI interface for Serato DJ Pro, with read and crate edits of the on-disk library",
   "main": "dist/server.js",
   "scripts": {
     "start": "node dist/server.js",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
-    "test": "tsc -p tsconfig.test.json && node --test --test-concurrency=1 dist-test/library/library.test.js dist-test/live.test.js"
+    "test": "tsc -p tsconfig.test.json && node --test --test-concurrency=1 dist-test/library/library.test.js dist-test/live.test.js dist-test/midi.test.js"
   },
   "engines": {
     "node": ">=22.13.0"

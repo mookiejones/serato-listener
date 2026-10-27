@@ -16,7 +16,7 @@ PORT=9000 npm start
 curl 127.0.0.1:8787/health
 ```
 
-Open Serato DJ Pro on the same Mac. It finds the advert and connects by itself. Discovery uses the macOS `dns-sd` command, so pairing does not start on Windows or Linux. The HTTP API still does.
+Open Serato DJ Pro on the same Mac. It finds the advert and connects by itself. Discovery uses the macOS `dns-sd` command, so pairing does not start on Windows or Linux. The HTTP API still does. On macOS the process also listens to the DJM-S11 and PLX-CRSS12 CoreMIDI inputs. That does not open the mixer's audio device.
 
 Quit Serato before a crate edit. The first write in a process copies `master.sqlite` and, when it is present, `root.sqlite` into `Library/Backups`. Writes are refused while Serato DJ Pro is running.
 
@@ -37,8 +37,9 @@ The process binds `127.0.0.1` only.
 
 | Method | Path | What it returns |
 | --- | --- | --- |
-| GET | `/health` | Pairing, and the master and root paths |
+| GET | `/health` | Pairing, the master and root paths, and whether MIDI is on |
 | GET | `/events` | Server-Sent Events: a snapshot, then 16 ms batches |
+| GET | `/api/midi` | DJM-S11 and PLX-CRSS12 port names, and the latest MIDI controls |
 | GET | `/api/library` | Tracks, crates, metadata, lock status, and decks linked to library rows |
 | GET | `/api/crates` | Crates for one space (`space` query) |
 | POST | `/api/crates` | `create`, `rename`, `delete`, `add`, or `remove` |
@@ -47,6 +48,20 @@ The process binds `127.0.0.1` only.
 Crate posts require the header `X-Serato-Listener: 1`. A crate stores an export path in `dj_container_metadata.filename`: ancestor names joined by `%%`, then `.crate`, or `.scrate` for a smart crate. The same rows are mirrored into `root.sqlite` when that file is connected.
 
 `GET /api/library` fills `decks[].track_id` when a live deck's file path matches a track's resolved path or its `portable_id`.
+
+## MIDI
+
+`npm start` on macOS compiles `src/midi-listen.swift` with `swiftc` into `dist/midi-listen` when the source is newer, then subscribes to CoreMIDI sources whose names contain `DJM-S11` or `PLX-CRSS12`. Serato can keep those ports open. CoreMIDI shares them. The helper does not open the DJM-S11 audio device.
+
+Two sources with the same name are labeled in CoreMIDI unique-id order, for example `PLX-CRSS12 #1` and `PLX-CRSS12 #2`.
+
+`GET /api/midi` returns `{ ok, ports, controls }`. A control is a note, control change, pitch bend, channel pressure, program change, or polyphonic pressure. Channels are 1 through 16. Pitch bend runs from −8192 to 8191. A note-on with velocity 0 is stored as `on: false`. Clock and active sensing are dropped. Low-half control changes (controllers 32 through 63) are kept as their own controls.
+
+The `/events` snapshot adds `midiPorts` and `midiControls`. Each 16 ms batch adds `midi`, the messages since the previous batch. `/health` adds `midi` (true when the helper is running) and `midiPorts`.
+
+This is the mixer's and turntables' MIDI, not the DJM-S11 HID reports, and not the fader values Serato forwards over OSC. OSC still reports upfaders and the crossfader after Serato has read them.
+
+Passing no arguments to `dist/midi-listen` uses the same two name filters. Extra arguments are case-insensitive substrings that replace those filters.
 
 ## How the remote handshake works
 
@@ -68,8 +83,8 @@ The same binary also stores FX, sampler, and hardware status addresses that this
 npm test
 ```
 
-The suite builds a temporary database and temporary ID3 bytes. It does not open a live Serato library and it does not publish a Bonjour advert.
+The suite builds a temporary database and temporary ID3 bytes. It does not open a live Serato library, publish a Bonjour advert, or compile or spawn the MIDI helper.
 
 ## Layout
 
-`src/live.ts` is the OSC codec and the deck session. `src/server.ts` is HTTP, the TCP listener, and `dns-sd`. `src/library/` reads and edits the SQLite library and the Markers2 / BeatGrid tags. `npm run build` compiles those files to `dist/`. `node dist/server.js` is what `npm start` runs.
+`src/live.ts` is the OSC codec and the deck session. `src/server.ts` is HTTP, the TCP listener, and `dns-sd`. `src/midi.ts` parses MIDI and spawns the helper. `src/midi-listen.swift` is that CoreMIDI client. `src/library/` reads and edits the SQLite library and the Markers2 / BeatGrid tags. `npm run build` compiles the TypeScript to `dist/`. `node dist/server.js` is what `npm start` runs, and on macOS it compiles the Swift helper into `dist/` on startup.

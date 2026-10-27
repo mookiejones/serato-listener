@@ -7,6 +7,9 @@
  * Deck file paths from the OSC stream are passed into that API so a playing
  * track can be linked to its library row.
  *
+ * On macOS, `main` also subscribes to the DJM-S11 and PLX-CRSS12 CoreMIDI
+ * inputs. `GET /api/midi` returns those controls. Tests leave that helper off.
+ *
  * The page port is `127.0.0.1:8787` unless `PORT` is set. The OSC port is
  * ephemeral. Discovery uses the macOS `dns-sd` command; on Windows and Linux
  * the advert fails and the HTTP API still runs.
@@ -19,6 +22,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { logError, logInfo } from './log';
 import { LiveSession, PEER_NAME, selfTest } from './live';
+import { MidiHub } from './midi';
 import { answerLibrary, readLibraryBody } from './library/http';
 import { masterPath, rootPath } from './library/db';
 
@@ -66,8 +70,10 @@ export interface RunningListener {
   oscPort: number;
   /** Live deck state. Tests can feed messages here without a real Serato socket. */
   session: LiveSession;
+  /** MIDI controls. Tests can `ingestLine` without spawning the CoreMIDI helper. */
+  midi: MidiHub;
   /**
-   * Closes the HTTP server, the OSC server, and the Bonjour advert.
+   * Closes the HTTP server, the OSC server, the Bonjour advert, and the MIDI helper.
    *
    * Side effects: stops listening and drops open sockets.
    */
@@ -79,13 +85,19 @@ export interface RunningListener {
  *
  * @param options.httpPort Port for the JSON API. `0` asks the OS for a free port.
  * @param options.advertise When false, `dns-sd` is not spawned. The default is true.
- * @returns The bound ports, the live session, and `stop`.
+ * @param options.midi When true, compile and spawn the CoreMIDI helper. The default is false.
+ * @returns The bound ports, the live session, the MIDI hub, and `stop`.
  *
- * Side effects: runs `selfTest`, listens on localhost and on `0.0.0.0`, and may spawn `dns-sd`.
+ * Side effects: runs `selfTest`, listens on localhost and on `0.0.0.0`, and may spawn `dns-sd` and `swiftc`.
  */
-export async function start(options?: { httpPort?: number; advertise?: boolean }): Promise<RunningListener> {
+export async function start(options?: {
+  httpPort?: number;
+  advertise?: boolean;
+  midi?: boolean;
+}): Promise<RunningListener> {
   selfTest();
   const session = new LiveSession({ info: logInfo, error: logError });
+  const midi = new MidiHub({ info: logInfo, error: logError });
   const sseClients = new Set<ServerResponse>();
 
   /**
@@ -109,9 +121,11 @@ export async function start(options?: { httpPort?: number; advertise?: boolean }
   const oscServer = net.createServer((socket) => session.attachSocket(socket));
   const oscPort = await listenOsc(oscServer);
   const advert = options?.advertise === false ? null : advertise(oscPort);
+  if (options?.midi) midi.start();
   const timer = setInterval(() => {
     const events = session.takePending();
-    if (!events.length) return;
+    const midiEvents = midi.takePending();
+    if (!events.length && !midiEvents.length) return;
     broadcast({
       type: 'batch',
       paired: session.state.paired,
@@ -121,13 +135,15 @@ export async function start(options?: { httpPort?: number; advertise?: boolean }
       upfaders: session.state.upfaders,
       tracks: session.state.tracks,
       events,
+      midi: midiEvents,
     });
   }, 16);
 
   /**
    * Answers one HTTP request.
    * `/events` is the live feed. `/health` does not open the library.
-   * `/api/` reads or edits the library and includes the current decks.
+   * `/api/midi` is the mixer and turntable controls.
+   * Other `/api/` paths read or edit the library and include the current decks.
    *
    * @param req The incoming request.
    * @param res The response.
@@ -143,7 +159,10 @@ export async function start(options?: { httpPort?: number; advertise?: boolean }
           'Cache-Control': 'no-cache',
           Connection: 'keep-alive',
         });
-        res.write(`data: ${JSON.stringify(session.snapshot())}\n\n`);
+        const snap = session.snapshot();
+        snap.midiPorts = midi.portNames();
+        snap.midiControls = midi.controlsList();
+        res.write(`data: ${JSON.stringify(snap)}\n\n`);
         sseClients.add(res);
         req.on('close', () => sseClients.delete(res));
         return;
@@ -156,6 +175,8 @@ export async function start(options?: { httpPort?: number; advertise?: boolean }
           crossfader: session.state.crossfader,
           library: masterPath(),
           root: rootPath(),
+          midi: midi.enabled,
+          midiPorts: midi.portNames(),
         });
         return;
       }
@@ -166,7 +187,12 @@ export async function start(options?: { httpPort?: number; advertise?: boolean }
           events: '/events',
           health: '/health',
           library: '/api/library',
+          midi: '/api/midi',
         });
+        return;
+      }
+      if (url.pathname === '/api/midi' && (req.method || 'GET') === 'GET') {
+        sendJson(res, 200, { ok: true, ports: midi.portNames(), controls: midi.controlsList() });
         return;
       }
       if (url.pathname.startsWith('/api/')) {
@@ -198,14 +224,16 @@ export async function start(options?: { httpPort?: number; advertise?: boolean }
     port: boundHttp,
     oscPort,
     session,
+    midi,
     /**
-     * Stops both servers and the advert.
+     * Stops both servers, the advert, and the MIDI helper.
      * The flush timer is cleared first so a batch cannot write to a closed response.
      *
-     * Side effects: closes sockets and, when it was spawned, signals `dns-sd`.
+     * Side effects: closes sockets and, when they were spawned, signals `dns-sd` and the MIDI helper.
      */
     async stop() {
       clearInterval(timer);
+      midi.stop();
       if (advert && !advert.killed) advert.kill('SIGTERM');
       sseClients.clear();
       await closeServer(httpServer);
@@ -307,7 +335,7 @@ function advertise(port: number): ChildProcess {
  * Side effects: everything `start` does, plus signal handlers that exit the process.
  */
 async function main(): Promise<void> {
-  const running = await start();
+  const running = await start({ midi: true });
   /**
    * Stops the servers and ends the process.
    *
