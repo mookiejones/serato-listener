@@ -55,23 +55,15 @@ Crate posts require the header `X-Serato-Listener: 1`. A crate stores an export 
 
 When a deck's title, artist, file path, or loaded flag changes, the listener broadcasts a `related` event for every deck whose matches changed. The `/events` snapshot includes `related`, one object per deck. `GET /api/related?deck=0` and `GET /api/related?path=` return that object for one deck or one file. Deck numbers in the API are 0 through 3. The page labels them Deck 1 through Deck 4.
 
-Saved matches come from serato-library-manager's Related Tracks sidecar. The listener opens it read-only and closes it before returning. The file is `related-tracks.sqlite` beside `master.sqlite`. `related_tracks.sqlite` is used when only that name is present. `SERATO_RELATED_PATH` replaces either one. A missing file, a database that is not the sidecar, or a file that cannot be read leaves saved matches empty and still returns suggestions.
+Saved matches come from serato-library-manager's Related Tracks sidecar, `related.sqlite`. The listener opens it read-only (`PRAGMA query_only`) and closes it before returning. It does not create the file or change a row. The default location is the library manager's settings directory:
 
-The canonical table, until `docs/related-tracks.md` in that repository names the final schema, is:
+- macOS: `~/Library/Application Support/Serato Library/related.sqlite`
+- Windows: `%APPDATA%\Serato Library\related.sqlite`
+- Linux: `$XDG_CONFIG_HOME/serato-library/related.sqlite`, or `~/.config/serato-library/related.sqlite`
 
-```sql
-CREATE TABLE related_track (
-  id INTEGER PRIMARY KEY,
-  asset_id INTEGER,
-  related_asset_id INTEGER,
-  portable_id TEXT,
-  related_portable_id TEXT,
-  note TEXT,
-  position INTEGER
-);
-```
+`SERATO_RELATED_PATH` replaces that file. An absolute `SERATO_LIBRARY_CONFIG_DIR` replaces the directory. A missing file, a database whose `user_version` is not 1, or a file that cannot be read leaves saved matches empty and still returns suggestions.
 
-A row matches in either direction. `position` orders saved matches. `src/library/related-store.ts` is the only module that reads this file. It also accepts `related_tracks`, `track_relation` (`left_asset_id`, `right_asset_id`), and a few other nearby names.
+Schema version 1 has `track` (`path`, `title`, `artist`, `length_ms`) and `link` (`from_track_id`, `to_track_id`, `mutual`, `note`, `rating`). Each link is one direction. `mutual` 1 is also visible from the other track. The playing file is matched by path, then by a unique case-insensitive path, then by a unique title, artist, and length in whole seconds. A fallback row whose stored path is still a different library track is skipped. The listener does not write the new path. Each saved match includes the link's note and rating (1 through 5, or null). `src/library/related-store.ts` is the only module that reads this file.
 
 Suggestions come from `master.sqlite`. A suggestion has a compatible Camelot key (the same key, one step around the wheel, or the relative major or minor) and a BPM within 6% of the playing track. Half-time and double-time count. Quadruple time does not. Tracks that share a crate rank above the same musical match with no shared crate. Tracks loaded on the other decks are left out. Saved matches are listed first. The list is capped at 10.
 

@@ -25,7 +25,13 @@ import {
   type RelatedBody,
   type RelatedMatch,
 } from './related';
-import { RELATED_TRACK_DDL, sameTrackPath, setRelatedPathForTests } from './related-store';
+import {
+  RELATED_SCHEMA_SQL,
+  defaultRelatedPath,
+  identityPath,
+  sameTrackPath,
+  setRelatedPathForTests,
+} from './related-store';
 import { start } from '../server';
 
 /**
@@ -35,16 +41,18 @@ import { start } from '../server';
  *
  * Side effects: creates a temporary directory and redirects the master path.
  */
-function useLibrary(): { dir: string; db: string; stop: () => void } {
+function useLibrary(): { dir: string; db: string; related: string; stop: () => void } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'serato-related-'));
   const db = path.join(dir, 'master.sqlite');
+  const related = path.join(dir, 'related.sqlite');
   buildDatabase(db);
   setMasterPathForTests(db);
-  setRelatedPathForTests(null);
+  setRelatedPathForTests(related);
   invalidateLibraryCache();
   return {
     dir,
     db,
+    related,
     /**
      * Restores the live paths and deletes the temporary directory.
      *
@@ -101,6 +109,80 @@ function withDb(file: string, fn: (db: DatabaseSync) => void): void {
   } finally {
     db.close();
   }
+}
+
+/** Timestamp stored on sidecar rows. The reader does not compare it. */
+const SIDECAR_STAMP = '2026-01-01T00:00:00Z';
+
+/**
+ * Creates a version-1 sidecar and lets the caller insert rows.
+ *
+ * @param file Sidecar path.
+ * @param fill Inserts tracks and links.
+ *
+ * Side effects: creates `file` and closes it.
+ */
+function writeSidecar(file: string, fill: (db: DatabaseSync) => void): void {
+  withDb(file, (db) => {
+    db.exec(RELATED_SCHEMA_SQL);
+    db.exec('PRAGMA user_version = 1');
+    fill(db);
+  });
+}
+
+/**
+ * Inserts one sidecar track. The stored path is the canonical identity of `portable`.
+ *
+ * @param db Open sidecar.
+ * @param id Sidecar track id.
+ * @param portable Live path or portable id.
+ * @param title Track title.
+ * @param artist Track artist.
+ * @param lengthMs Length in milliseconds, or null.
+ *
+ * Side effects: inserts one `track` row.
+ */
+function insertSidecarTrack(
+  db: DatabaseSync,
+  id: number,
+  portable: string,
+  title: string,
+  artist: string,
+  lengthMs: number | null,
+): void {
+  const stored = identityPath(portable);
+  assert.ok(stored);
+  db.prepare(
+    'INSERT INTO track (id, path, title, artist, length_ms, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+  ).run(id, stored, title, artist, lengthMs, SIDECAR_STAMP, SIDECAR_STAMP);
+}
+
+/**
+ * Inserts one directional link.
+ *
+ * @param db Open sidecar.
+ * @param id Link id. Saved matches are ordered by this.
+ * @param fromId Sidecar track the link starts from.
+ * @param toId Sidecar track the link points at.
+ * @param mutual 1 when the other track can see the link too.
+ * @param note Note text. Blank becomes null in the payload.
+ * @param rating Rating from 1 to 5, or null.
+ *
+ * Side effects: inserts one `link` row.
+ */
+function insertLink(
+  db: DatabaseSync,
+  id: number,
+  fromId: number,
+  toId: number,
+  mutual: 0 | 1,
+  note: string,
+  rating: number | null,
+): void {
+  db.prepare(
+    `INSERT INTO link (id, from_track_id, to_track_id, mutual, note, rating, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(id, fromId, toId, mutual, note, rating, SIDECAR_STAMP, SIDECAR_STAMP);
 }
 
 /**
@@ -179,31 +261,44 @@ test('a missing sidecar still suggests a harmonic match and does not create the 
     assert.equal(body.matches.length, 1);
     assert.equal(body.matches[0].source, 'suggestion');
     assert.equal(body.matches[0].track_id, 2);
+    assert.equal(body.matches[0].rating, null);
     assert.deepEqual(body.matches[0].reasons, ['key', 'bpm']);
-    assert.equal(fs.existsSync(path.join(temp.dir, 'related-tracks.sqlite')), false);
-    assert.equal(currentRelatedPath(), path.join(temp.dir, 'related-tracks.sqlite'));
+    assert.equal(fs.existsSync(temp.related), false);
+    assert.equal(currentRelatedPath(), temp.related);
   } finally {
     temp.stop();
   }
 });
 
-test('an unreadable sidecar and an unrecognized schema still leave suggestions', () => {
+test('an unreadable sidecar and a database that is not version 1 still leave suggestions', () => {
   const temp = useLibrary();
   try {
-    const corrupt = path.join(temp.dir, 'related-tracks.sqlite');
-    fs.writeFileSync(corrupt, 'not a database');
+    fs.writeFileSync(temp.related, 'not a database');
     const broken = relatedForDeck([{ deck: 0, filepath: 'Music/same-a.mp3' }], 0);
     assert.equal(broken.sidecar, 'unavailable');
     assert.equal(broken.matches[0].track_id, 2);
-    fs.rmSync(corrupt);
+    fs.rmSync(temp.related);
 
-    const wrong = path.join(temp.dir, 'related-tracks.sqlite');
-    withDb(wrong, (db) => {
+    withDb(temp.related, (db) => {
+      db.exec(RELATED_SCHEMA_SQL);
+      db.exec('PRAGMA user_version = 2');
+      insertSidecarTrack(db, 1, 'Music/same-a.mp3', 'Same', 'Artist', 180000);
+      insertSidecarTrack(db, 2, 'Music/same-b.mp3', 'Same', 'Artist', 180500);
+      insertLink(db, 1, 1, 2, 0, 'from a future schema', 5);
+    });
+    const future = relatedForDeck([{ deck: 0, filepath: 'Music/same-a.mp3' }], 0);
+    assert.equal(future.sidecar, 'schema');
+    assert.equal(future.matches[0].source, 'suggestion');
+    assert.equal(future.matches[0].track_id, 2);
+    assert.equal(future.matches[0].note, null);
+    assert.equal(future.matches.some((match) => match.source === 'saved'), false);
+
+    fs.rmSync(temp.related);
+    withDb(temp.related, (db) => {
       db.exec('CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)');
     });
     const schema = relatedForDeck([{ deck: 0, filepath: 'Music/same-a.mp3' }], 0);
     assert.equal(schema.sidecar, 'schema');
-    assert.equal(schema.matches[0].track_id, 2);
     assert.equal(schema.matches[0].source, 'suggestion');
   } finally {
     temp.stop();
@@ -252,16 +347,18 @@ test('saved matches rank first, then crate, key, and tempo', async () => {
         insertMember.run(id, asset, locationContainer, locationContainer === 10 ? 10 : 11);
       }
     });
-    const sidecar = path.join(temp.dir, 'related-tracks.sqlite');
-    withDb(sidecar, (db) => {
-      db.exec(RELATED_TRACK_DDL);
-      db.prepare(
-        'INSERT INTO related_track (portable_id, related_portable_id, note, position) VALUES (?, ?, ?, ?)',
-      ).run('Music/source.mp3', 'Music/external.mp3', 'opens the floor', 0);
-      db.prepare('INSERT INTO related_track (asset_id, related_asset_id, note, position) VALUES (?, ?, ?, ?)').run(20, 10, 'warm', 1);
-      db.prepare('INSERT INTO related_track (asset_id, related_asset_id, position) VALUES (?, ?, ?)').run(10, 21, 2);
+    writeSidecar(temp.related, (db) => {
+      insertSidecarTrack(db, 1, 'Music/source.mp3', 'Source', 'DJ', null);
+      insertSidecarTrack(db, 2, 'Music/external.mp3', 'External', 'Guest', null);
+      insertSidecarTrack(db, 3, 'Music/saved-odd.mp3', 'SavedOdd', 'DJ', null);
+      insertSidecarTrack(db, 4, 'Music/saved-second.mp3', 'SavedSecond', 'DJ', null);
+      insertSidecarTrack(db, 5, 'Music/off-key.mp3', 'OffKey', 'DJ', null);
+      insertLink(db, 1, 1, 2, 0, 'opens the floor', 5);
+      insertLink(db, 2, 1, 3, 0, 'warm', 3);
+      insertLink(db, 3, 4, 1, 1, 'both ways', null);
+      insertLink(db, 4, 5, 1, 0, 'hidden', 1);
     });
-    fs.chmodSync(sidecar, 0o444);
+    fs.chmodSync(temp.related, 0o444);
     invalidateLibraryCache();
 
     const decks: PlayingDeckInput[] = [
@@ -277,12 +374,19 @@ test('saved matches rank first, then crate, key, and tempo', async () => {
     assert.equal(body.key, '8A');
     assert.equal(body.bpm, 128);
     assert.deepEqual(matchIds(body), [null, 20, 21, 11, 12, 13, 14, 15]);
-    assert.equal(body.matches[0].filepath, 'Music/external.mp3');
+    assert.equal(body.matches[0].title, 'External');
+    assert.equal(body.matches[0].artist, 'Guest');
+    assert.equal(body.matches[0].filepath, identityPath('Music/external.mp3'));
     assert.equal(body.matches[0].note, 'opens the floor');
+    assert.equal(body.matches[0].rating, 5);
     assert.deepEqual(body.matches[0].reasons, ['saved']);
     assert.equal(body.matches[1].title, 'SavedOdd');
     assert.equal(body.matches[1].note, 'warm');
+    assert.equal(body.matches[1].rating, 3);
     assert.equal(body.matches[2].source, 'saved');
+    assert.equal(body.matches[2].note, 'both ways');
+    assert.equal(body.matches[2].rating, null);
+    assert.equal(body.matches.some((match) => match.note === 'hidden'), false);
     const bravo = body.matches[3];
     assert.equal(bravo.title, 'Bravo');
     assert.deepEqual(bravo.reasons, ['key', 'bpm', 'crate']);
@@ -333,10 +437,10 @@ test('suggestions stop at the cap after the saved match', () => {
       }
       insertTrack(db, 50, 'Saved', 90, '6A', 'Music/saved.mp3');
     });
-    const sidecar = path.join(temp.dir, 'related-tracks.sqlite');
-    withDb(sidecar, (db) => {
-      db.exec(RELATED_TRACK_DDL);
-      db.prepare('INSERT INTO related_track (asset_id, related_asset_id, position) VALUES (1, 50, 0)').run();
+    writeSidecar(temp.related, (db) => {
+      insertSidecarTrack(db, 1, 'Music/same-a.mp3', 'Same', 'Artist', 180000);
+      insertSidecarTrack(db, 2, 'Music/saved.mp3', 'Saved', 'DJ', null);
+      insertLink(db, 1, 1, 2, 0, '', null);
     });
     invalidateLibraryCache();
     const body = relatedForDeck([{ deck: 0, filepath: 'Music/same-a.mp3', title: 'Same', artist: 'Artist' }], 0);
@@ -353,83 +457,156 @@ test('suggestions stop at the cap after the saved match', () => {
   }
 });
 
-test('the underscore sidecar is read, and the hyphen name wins when both exist', () => {
+test('a unique title, artist, and whole-second length matches a moved file', () => {
   const temp = useLibrary();
   try {
-    const underscore = path.join(temp.dir, 'related_tracks.sqlite');
-    withDb(underscore, (db) => {
-      db.exec(RELATED_TRACK_DDL);
-      db.prepare("INSERT INTO related_track (asset_id, related_asset_id, note, position) VALUES (1, 2, 'from underscore', 0)").run();
+    const moved = path.join(temp.dir, 'moved.mp3');
+    const oldPath = path.join(temp.dir, 'old.mp3');
+    withDb(temp.db, (db) => {
+      insertTrack(db, 10, 'Moved', 100, '5A', moved);
+      db.prepare("UPDATE asset SET artist = 'Night', length_ms = 180400 WHERE id = 10").run();
+      insertTrack(db, 20, 'Partner', 70, '12A', 'Music/partner.mp3');
+    });
+    writeSidecar(temp.related, (db) => {
+      db.prepare(
+        'INSERT INTO track (id, path, title, artist, length_ms, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      ).run(1, oldPath, ' moved ', ' night ', 180100, SIDECAR_STAMP, SIDECAR_STAMP);
+      insertSidecarTrack(db, 2, 'Music/partner.mp3', 'Partner', 'DJ', null);
+      insertLink(db, 1, 1, 2, 0, 'moved file', 4);
     });
     invalidateLibraryCache();
-    const first = relatedForDeck([{ deck: 0, filepath: 'Music/same-a.mp3' }], 0);
-    assert.equal(currentRelatedPath(), underscore);
-    assert.equal(first.sidecar, 'ok');
-    assert.equal(first.matches.length, 1);
-    assert.equal(first.matches[0].source, 'saved');
-    assert.equal(first.matches[0].track_id, 2);
-    assert.equal(first.matches[0].note, 'from underscore');
-
-    const hyphen = path.join(temp.dir, 'related-tracks.sqlite');
-    withDb(hyphen, (db) => {
-      db.exec(RELATED_TRACK_DDL);
-      db.prepare("INSERT INTO related_track (asset_id, related_asset_id, note, position) VALUES (1, 2, 'from hyphen', 0)").run();
-    });
-    const second = relatedForDeck([{ deck: 0, filepath: 'Music/same-a.mp3' }], 0);
-    assert.equal(currentRelatedPath(), hyphen);
-    assert.equal(second.matches[0].note, 'from hyphen');
-  } finally {
-    temp.stop();
-  }
-});
-
-test('a left and right relation table is read in either direction', () => {
-  const temp = useLibrary();
-  try {
-    const sidecar = path.join(temp.dir, 'related-tracks.sqlite');
-    withDb(sidecar, (db) => {
-      db.exec(
-        `CREATE TABLE track_relation (
-           id INTEGER PRIMARY KEY,
-           left_asset_id INTEGER,
-           right_asset_id INTEGER,
-           note TEXT,
-           position INTEGER
-         )`,
-      );
-      db.prepare('INSERT INTO track_relation (left_asset_id, right_asset_id, note, position) VALUES (2, 1, \'alias\', 0)').run();
-    });
-    const body = relatedForDeck([{ deck: 0, filepath: 'Music/same-a.mp3' }], 0);
+    const body = relatedForDeck([{ deck: 0, filepath: moved, title: 'Live', artist: 'Live' }], 0);
     assert.equal(body.sidecar, 'ok');
+    assert.equal(body.track_id, 10);
     assert.equal(body.matches.length, 1);
     assert.equal(body.matches[0].source, 'saved');
-    assert.equal(body.matches[0].track_id, 2);
-    assert.equal(body.matches[0].note, 'alias');
+    assert.equal(body.matches[0].track_id, 20);
+    assert.equal(body.matches[0].note, 'moved file');
+    assert.equal(body.matches[0].rating, 4);
   } finally {
     temp.stop();
   }
 });
 
-test('the related path honors the test override and the environment', () => {
+test('an ambiguous fallback and a fallback that names another library track are skipped', () => {
+  const temp = useLibrary();
+  try {
+    const playing = path.join(temp.dir, 'playing.mp3');
+    const other = path.join(temp.dir, 'other-copy.mp3');
+    withDb(temp.db, (db) => {
+      insertTrack(db, 10, 'Twin', 90, '3A', playing);
+      db.prepare("UPDATE asset SET artist = 'Duo', length_ms = 200000 WHERE id = 10").run();
+      insertTrack(db, 11, 'Twin', 90, '3A', other);
+      db.prepare("UPDATE asset SET artist = 'Duo', length_ms = 200200 WHERE id = 11").run();
+      insertTrack(db, 20, 'Only', 90, '3A', 'Music/only.mp3');
+    });
+    writeSidecar(temp.related, (db) => {
+      db.prepare(
+        'INSERT INTO track (id, path, title, artist, length_ms, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      ).run(1, path.join(temp.dir, 'first-old.mp3'), 'Twin', 'Duo', 200100, SIDECAR_STAMP, SIDECAR_STAMP);
+      db.prepare(
+        'INSERT INTO track (id, path, title, artist, length_ms, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      ).run(2, path.join(temp.dir, 'second-old.mp3'), 'Twin', 'Duo', 200900, SIDECAR_STAMP, SIDECAR_STAMP);
+      insertSidecarTrack(db, 3, 'Music/only.mp3', 'Only', 'DJ', null);
+      insertLink(db, 1, 1, 3, 0, 'ambiguous', 2);
+    });
+    invalidateLibraryCache();
+    const ambiguous = relatedForDeck([{ deck: 0, filepath: playing }], 0);
+    assert.equal(ambiguous.matches.some((match) => match.source === 'saved'), false);
+
+    fs.chmodSync(temp.related, 0o644);
+    fs.rmSync(temp.related);
+    writeSidecar(temp.related, (db) => {
+      insertSidecarTrack(db, 1, other, 'Twin', 'Duo', 200200);
+      insertSidecarTrack(db, 2, 'Music/only.mp3', 'Only', 'DJ', null);
+      insertLink(db, 1, 1, 2, 0, 'still the other copy', 2);
+    });
+    const rebound = relatedForDeck([{ deck: 0, filepath: playing }], 0);
+    assert.equal(rebound.track_id, 10);
+    assert.equal(rebound.matches.some((match) => match.note === 'still the other copy'), false);
+    assert.equal(rebound.matches.some((match) => match.source === 'saved'), false);
+  } finally {
+    temp.stop();
+  }
+});
+
+test('a unique case-insensitive path matches', () => {
+  const temp = useLibrary();
+  try {
+    const live = path.join(temp.dir, 'Case.mp3');
+    const stored = path.join(temp.dir, 'case.mp3');
+    assert.notEqual(live, stored);
+    withDb(temp.db, (db) => {
+      insertTrack(db, 10, 'Cased', 110, '4A', live);
+      insertTrack(db, 20, 'Friend', 110, '4A', 'Music/friend.mp3');
+    });
+    writeSidecar(temp.related, (db) => {
+      db.prepare(
+        'INSERT INTO track (id, path, title, artist, length_ms, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      ).run(1, stored, 'Cased', 'DJ', null, SIDECAR_STAMP, SIDECAR_STAMP);
+      insertSidecarTrack(db, 2, 'Music/friend.mp3', 'Friend', 'DJ', null);
+      insertLink(db, 1, 1, 2, 0, 'folded', 2);
+    });
+    invalidateLibraryCache();
+    const body = relatedForDeck([{ deck: 0, filepath: live }], 0);
+    assert.equal(body.sidecar, 'ok');
+    assert.equal(body.track_id, 10);
+    assert.equal(body.matches[0].source, 'saved');
+    assert.equal(body.matches[0].track_id, 20);
+    assert.equal(body.matches[0].note, 'folded');
+    assert.equal(body.matches[0].rating, 2);
+  } finally {
+    temp.stop();
+  }
+});
+
+test('the related path follows the settings directory, then the environment, then the test override', () => {
+  assert.equal(
+    defaultRelatedPath({ platform: 'darwin', home: '/Users/dj' }),
+    '/Users/dj/Library/Application Support/Serato Library/related.sqlite',
+  );
+  assert.equal(
+    defaultRelatedPath({ platform: 'win32', home: 'C:\\Users\\dj', appData: 'C:\\Users\\dj\\AppData\\Roaming' }),
+    'C:\\Users\\dj\\AppData\\Roaming\\Serato Library\\related.sqlite',
+  );
+  assert.equal(
+    defaultRelatedPath({ platform: 'win32', home: 'C:\\Users\\dj', appData: null }),
+    'C:\\Users\\dj\\AppData\\Roaming\\Serato Library\\related.sqlite',
+  );
+  assert.equal(
+    defaultRelatedPath({ platform: 'linux', home: '/home/dj', xdgConfigHome: null }),
+    '/home/dj/.config/serato-library/related.sqlite',
+  );
+  assert.equal(
+    defaultRelatedPath({ platform: 'linux', home: '/home/dj', xdgConfigHome: '/xdg' }),
+    '/xdg/serato-library/related.sqlite',
+  );
+  assert.equal(identityPath(''), null);
+  assert.equal(identityPath('a\0b'), null);
+  assert.equal(identityPath(`~${path.sep}Music${path.sep}a.mp3`), path.resolve(path.join(os.homedir(), 'Music', 'a.mp3')));
+  const missing = `serato-related-missing-${process.pid}/no-such-file.mp3`;
+  assert.equal(identityPath(missing), path.resolve(path.join(os.homedir(), missing)));
+
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'serato-related-path-'));
   const previous = process.env.SERATO_RELATED_PATH;
-  const previousMaster = process.env.SERATO_LIBRARY_PATH;
+  const previousConfig = process.env.SERATO_LIBRARY_CONFIG_DIR;
   try {
-    setMasterPathForTests(path.join(dir, 'master.sqlite'));
     setRelatedPathForTests(path.join(dir, 'override.sqlite'));
     assert.equal(currentRelatedPath(), path.join(dir, 'override.sqlite'));
     setRelatedPathForTests(null);
     process.env.SERATO_RELATED_PATH = path.join(dir, 'env.sqlite');
+    process.env.SERATO_LIBRARY_CONFIG_DIR = dir;
     assert.equal(currentRelatedPath(), path.join(dir, 'env.sqlite'));
     delete process.env.SERATO_RELATED_PATH;
-    assert.equal(currentRelatedPath(), path.join(dir, 'related-tracks.sqlite'));
+    assert.equal(currentRelatedPath(), path.join(dir, 'related.sqlite'));
+    process.env.SERATO_LIBRARY_CONFIG_DIR = 'relative/serato-library';
+    assert.equal(currentRelatedPath(), defaultRelatedPath());
   } finally {
     setRelatedPathForTests(null);
-    setMasterPathForTests(null);
     if (previous == null) delete process.env.SERATO_RELATED_PATH;
     else process.env.SERATO_RELATED_PATH = previous;
-    if (previousMaster == null) delete process.env.SERATO_LIBRARY_PATH;
-    else process.env.SERATO_LIBRARY_PATH = previousMaster;
+    if (previousConfig == null) delete process.env.SERATO_LIBRARY_CONFIG_DIR;
+    else process.env.SERATO_LIBRARY_CONFIG_DIR = previousConfig;
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -484,7 +661,8 @@ test('the live page and the event stream follow the deck that is playing', async
 
     const health = await fetch(`http://127.0.0.1:${running.port}/health`);
     const healthBody = (await health.json()) as { related: string };
-    assert.equal(healthBody.related, path.join(temp.dir, 'related-tracks.sqlite'));
+    assert.equal(healthBody.related, temp.related);
+    assert.match(html, /\/5/);
 
     const writer = { write() {} };
     let phase: 'snapshot' | 'loaded' | 'switched' | 'playhead' = 'snapshot';

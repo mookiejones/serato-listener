@@ -11,7 +11,6 @@ import { LibraryError } from './errors';
 import {
   libraryKeyType,
   loadLibrary,
-  masterPath,
   trackIdForFile,
   type LibraryCrate,
   type LibraryPayload,
@@ -48,6 +47,7 @@ export interface RelatedMatch {
   reasons: string[];
   crates: string[];
   note: string | null;
+  rating: number | null;
 }
 
 /** Related tracks for one deck, or for one file path. */
@@ -74,12 +74,12 @@ interface RankedSuggestion {
 /**
  * Returns the sidecar path the process would open.
  *
- * @returns The path from the test override, the environment, or beside `master.sqlite`.
+ * @returns The path from the test override, `SERATO_RELATED_PATH`, or the settings directory.
  *
- * Side effects: may stat the candidate files. Does not open a database.
+ * Side effects: reads environment variables. Does not open a database.
  */
 export function currentRelatedPath(): string {
-  return sidecarPath(masterPath());
+  return sidecarPath();
 }
 
 /**
@@ -171,7 +171,7 @@ export function bpmDistance(source: number, candidate: number): number | null {
 export function relatedForDecks(decks: PlayingDeckInput[]): RelatedBody[] {
   const normalized = normalizeDecks(decks);
   const library = loadLibrary(undefined, normalized);
-  const sidecar = openSidecar(sidecarPath(masterPath()));
+  const sidecar = openSidecar(sidecarPath());
   return normalized.map((deck) =>
     buildRelated(library, sidecar, deck.deck, deck.filepath ?? null, deck.title ?? '', deck.artist ?? ''),
   );
@@ -208,7 +208,7 @@ export function relatedForPath(decks: PlayingDeckInput[], filePath: string): Rel
   if (!trimmed) throw new LibraryError('Pass a deck or a file path.');
   const normalized = normalizeDecks(decks);
   const library = loadLibrary(undefined, normalized);
-  const sidecar = openSidecar(sidecarPath(masterPath()));
+  const sidecar = openSidecar(sidecarPath());
   return buildRelated(library, sidecar, null, trimmed, '', '');
 }
 
@@ -255,16 +255,27 @@ function buildRelated(
 ): RelatedBody {
   const source = resolveSource(library.tracks, filepath, title, artist);
   const paths = sourcePaths(filepath, source);
-  const saved = sidecar.matchesFor({ assetId: source?.id ?? null, paths });
+  const saved = sidecar.matchesFor({
+    paths,
+    title: source?.name || title,
+    artist: source?.artist || artist,
+    lengthMs: source?.length_ms ?? null,
+    anchorId: source?.id ?? null,
+    library: library.tracks.map((track) => ({
+      id: track.id,
+      paths: [track.portable_id, track.resolved_path].filter((value): value is string => Boolean(value)),
+    })),
+  });
   const crates = cratesByAsset(library.crates);
   const blocked = elsewhere(library, deck);
+  const byId = new Map(library.tracks.map((track) => [track.id, track]));
   const savedIds = new Set<number>();
   const savedPaths: string[] = [];
   for (const match of saved) {
-    if (match.assetId != null) savedIds.add(match.assetId);
-    if (match.portableId) savedPaths.push(match.portableId);
+    const track = libraryTrackForPath(byId, match.path);
+    if (track) savedIds.add(track.id);
+    if (match.path) savedPaths.push(match.path);
   }
-  const byId = new Map(library.tracks.map((track) => [track.id, track]));
   const shownSaved = saved
     .filter((match) => !isSource(match, source, paths))
     .filter((match) => !blockedMatch(match, byId, blocked))
@@ -382,9 +393,9 @@ function elsewhere(library: LibraryPayload, sourceDeck: number | null): { ids: S
  * Side effects: none.
  */
 function isSource(match: SavedMatch, source: LibraryTrack | null, paths: string[]): boolean {
-  if (source && match.assetId === source.id) return true;
-  if (!match.portableId) return false;
-  return paths.some((file) => sameTrackPath(file, match.portableId || ''));
+  if (!match.path) return false;
+  if (source && trackIdForFile([source], match.path) === source.id) return true;
+  return paths.some((file) => sameTrackPath(file, match.path));
 }
 
 /**
@@ -402,9 +413,9 @@ function blockedMatch(
   byId: Map<number, LibraryTrack>,
   blocked: { ids: Set<number>; paths: string[] },
 ): boolean {
-  const track = match.assetId == null ? undefined : byId.get(match.assetId);
-  if (match.assetId != null && blocked.ids.has(match.assetId)) return true;
-  const paths = [match.portableId, track?.portable_id, track?.resolved_path].filter((value): value is string => Boolean(value));
+  const track = libraryTrackForPath(byId, match.path);
+  if (track && blocked.ids.has(track.id)) return true;
+  const paths = [match.path, track?.portable_id, track?.resolved_path].filter((value): value is string => Boolean(value));
   return paths.some((file) => blocked.paths.some((other) => sameTrackPath(file, other)));
 }
 
@@ -425,28 +436,40 @@ function savedMatch(
   source: LibraryTrack | null,
   crates: Map<number, string[]>,
 ): RelatedMatch {
-  let track = match.assetId == null ? undefined : byId.get(match.assetId);
-  if (!track && match.portableId) {
-    const id = trackIdForFile([...byId.values()], match.portableId);
-    if (id != null) track = byId.get(id);
-  }
+  const track = libraryTrackForPath(byId, match.path);
   const shared = source && track ? sharedCrates(crates, source.id, track.id) : [];
   let title = 'Related track';
   if (track) title = track.name;
-  else if (match.portableId) title = match.portableId;
-  else if (match.assetId != null) title = `Track ${match.assetId}`;
+  else if (match.title) title = match.title;
+  else if (match.path) title = match.path;
   return {
     source: 'saved',
-    track_id: track?.id ?? match.assetId,
+    track_id: track?.id ?? null,
     title,
-    artist: track?.artist ?? '',
-    filepath: track?.resolved_path ?? track?.portable_id ?? match.portableId,
+    artist: track?.artist || match.artist,
+    filepath: track?.resolved_path ?? track?.portable_id ?? (match.path || null),
     bpm: track?.bpm ?? null,
     key: track?.key ?? '',
     reasons: ['saved'],
     crates: shared,
     note: match.note,
+    rating: match.rating,
   };
+}
+
+/**
+ * Resolves a sidecar path to the library track it names.
+ *
+ * @param byId Library tracks by asset id.
+ * @param filePath Path stored on the sidecar track.
+ * @returns The library track, or undefined when the file is not in the library.
+ *
+ * Side effects: none.
+ */
+function libraryTrackForPath(byId: Map<number, LibraryTrack>, filePath: string): LibraryTrack | undefined {
+  if (!filePath) return undefined;
+  const id = trackIdForFile([...byId.values()], filePath);
+  return id == null ? undefined : byId.get(id);
 }
 
 /**
@@ -507,6 +530,7 @@ function rankSuggestions(
     reasons: item.crates.length ? ['key', 'bpm', 'crate'] : ['key', 'bpm'],
     crates: item.crates,
     note: null,
+    rating: null,
   }));
 }
 
