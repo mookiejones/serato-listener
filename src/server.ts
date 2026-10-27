@@ -3,9 +3,10 @@
  *
  * One process advertises `_SeratoIOSRemote._tcp` on macOS, accepts Serato's
  * TCP connection, and serves a localhost JSON API for the library. The browser
- * feed is `GET /events`. Library reads and crate edits are under `/api/`.
- * Deck file paths from the OSC stream are passed into that API so a playing
- * track can be linked to its library row.
+ * feed is `GET /events`. `GET /` is the live page. Library reads, related
+ * tracks, and crate edits are under `/api/`. Deck file paths from the OSC
+ * stream are passed into that API so a playing track can be linked to its
+ * library row, and a track change publishes related matches.
  *
  * On macOS, `main` also subscribes to the DJM-S11 and PLX-CRSS12 CoreMIDI
  * inputs. `GET /api/midi` returns those controls. Tests leave that helper off.
@@ -22,9 +23,12 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { logError, logInfo } from './log';
 import { LiveSession, PEER_NAME, selfTest } from './live';
+import { LIVE_PAGE } from './live-page';
 import { MidiHub } from './midi';
 import { answerLibrary, readLibraryBody } from './library/http';
+import { LibraryError } from './library/errors';
 import { masterPath, rootPath } from './library/db';
+import { currentRelatedPath, relatedForDecks, unavailableRelated, type RelatedBody } from './library/related';
 
 const DEFAULT_HTTP_PORT = Number(process.env.PORT || 8787);
 
@@ -60,6 +64,24 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
     'Content-Length': Buffer.byteLength(payload),
   });
   res.end(payload);
+}
+
+/**
+ * Sends an HTML document and does not cache it.
+ *
+ * @param res The HTTP response.
+ * @param status HTTP status code.
+ * @param html The document.
+ *
+ * Side effects: writes the response.
+ */
+function sendHtml(res: ServerResponse, status: number, html: string): void {
+  res.writeHead(status, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'Content-Length': Buffer.byteLength(html),
+  });
+  res.end(html);
 }
 
 /** A listener that is bound and can be stopped without exiting the process. */
@@ -112,6 +134,56 @@ export async function start(options?: {
     for (const res of sseClients) res.write(payload);
   };
   session.onUpdate = broadcast;
+  const relatedKeys = new Map<number, string>();
+  /**
+   * Writes a `related` event for each deck whose matches changed.
+   *
+   * @param bodies One payload per deck.
+   *
+   * Side effects: writes Server-Sent Events for the decks that changed.
+   */
+  const publishRelated = (bodies: RelatedBody[]): void => {
+    for (const body of bodies) {
+      if (body.deck == null) continue;
+      const key = JSON.stringify([
+        body.ok,
+        body.path,
+        body.track_id,
+        body.title,
+        body.artist,
+        body.key,
+        body.bpm,
+        body.sidecar,
+        body.error ?? '',
+        body.matches.map((match) => [match.source, match.track_id, match.filepath, match.reasons, match.note]),
+      ]);
+      if (relatedKeys.get(body.deck) === key) continue;
+      relatedKeys.set(body.deck, key);
+      broadcast({ type: 'related', ...body });
+    }
+  };
+  /**
+   * Reads related tracks for the current decks.
+   * A missing library is an empty result. The event stream stays open.
+   *
+   * @returns One payload per deck.
+   *
+   * Side effects: opens and closes the library and the sidecar. Logs unexpected failures.
+   */
+  const relatedNow = (): RelatedBody[] => {
+    try {
+      return relatedForDecks(session.decks());
+    } catch (err) {
+      if (!(err instanceof LibraryError) || err.status !== 404) {
+        const detail = err instanceof Error ? err.message : String(err);
+        logError(`related ${detail}`);
+      }
+      return session.state.tracks.map((track, deck) => unavailableRelated(deck, track));
+    }
+  };
+  session.onDeckTrack = () => {
+    publishRelated(relatedNow());
+  };
 
   const httpPort = options?.httpPort ?? DEFAULT_HTTP_PORT;
   const httpServer = http.createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -141,8 +213,8 @@ export async function start(options?: {
 
   /**
    * Answers one HTTP request.
-   * `/events` is the live feed. `/health` does not open the library.
-   * `/api/midi` is the mixer and turntable controls.
+   * `/` and `/live` are the related-tracks page. `/events` is the live feed.
+   * `/health` does not open the library. `/api/midi` is the mixer and turntable controls.
    * Other `/api/` paths read or edit the library and include the current decks.
    *
    * @param req The incoming request.
@@ -162,6 +234,7 @@ export async function start(options?: {
         const snap = session.snapshot();
         snap.midiPorts = midi.portNames();
         snap.midiControls = midi.controlsList();
+        snap.related = relatedNow();
         res.write(`data: ${JSON.stringify(snap)}\n\n`);
         sseClients.add(res);
         req.on('close', () => sseClients.delete(res));
@@ -175,20 +248,14 @@ export async function start(options?: {
           crossfader: session.state.crossfader,
           library: masterPath(),
           root: rootPath(),
+          related: currentRelatedPath(),
           midi: midi.enabled,
           midiPorts: midi.portNames(),
         });
         return;
       }
-      if (url.pathname === '/' && (req.method || 'GET') === 'GET') {
-        sendJson(res, 200, {
-          ok: true,
-          name: PEER_NAME,
-          events: '/events',
-          health: '/health',
-          library: '/api/library',
-          midi: '/api/midi',
-        });
+      if ((url.pathname === '/' || url.pathname === '/live') && (req.method || 'GET') === 'GET') {
+        sendHtml(res, 200, LIVE_PAGE);
         return;
       }
       if (url.pathname === '/api/midi' && (req.method || 'GET') === 'GET') {

@@ -2,7 +2,7 @@
 
 A local interface for [Serato DJ Pro](https://serato.com/dj/pro). One Node process pretends to be Serato's old iPhone remote, and it can also read and edit the on-disk library after Serato has quit.
 
-The live side speaks OSC. Serato browses for `_SeratoIOSRemote._tcp`, connects, and pushes deck status. The library side reads `master.sqlite` with `node:sqlite` (no native add-on) and mirrors crate edits into `root.sqlite`.
+The live side speaks OSC. Serato browses for `_SeratoIOSRemote._tcp`, connects, and pushes deck status. While a track is playing, the listener finds tracks that go with it and pushes those matches on the event stream. The library side reads `master.sqlite` with `node:sqlite` (no native add-on) and mirrors crate edits into `root.sqlite`.
 
 ## Run
 
@@ -37,8 +37,10 @@ The process binds `127.0.0.1` only.
 
 | Method | Path | What it returns |
 | --- | --- | --- |
-| GET | `/health` | Pairing, the master and root paths, and whether MIDI is on |
-| GET | `/events` | Server-Sent Events: a snapshot, then 16 ms batches |
+| GET | `/` and `/live` | The four decks, the track loaded on each, and its related tracks |
+| GET | `/health` | Pairing, the master, root, and related-tracks paths, and whether MIDI is on |
+| GET | `/events` | Server-Sent Events: a snapshot (including `related`), 16 ms batches, and a `related` event when a deck's track changes |
+| GET | `/api/related` | Saved and suggested matches for `deck` (0–3) or `path` |
 | GET | `/api/midi` | DJM-S11 and PLX-CRSS12 port names, and the latest MIDI controls |
 | GET | `/api/library` | Tracks, crates, metadata, lock status, and decks linked to library rows |
 | GET | `/api/crates` | Crates for one space (`space` query) |
@@ -48,6 +50,32 @@ The process binds `127.0.0.1` only.
 Crate posts require the header `X-Serato-Listener: 1`. A crate stores an export path in `dj_container_metadata.filename`: ancestor names joined by `%%`, then `.crate`, or `.scrate` for a smart crate. The same rows are mirrored into `root.sqlite` when that file is connected.
 
 `GET /api/library` fills `decks[].track_id` when a live deck's file path matches a track's resolved path or its `portable_id`.
+
+## Related tracks
+
+When a deck's title, artist, file path, or loaded flag changes, the listener broadcasts a `related` event for every deck whose matches changed. The `/events` snapshot includes `related`, one object per deck. `GET /api/related?deck=0` and `GET /api/related?path=` return that object for one deck or one file. Deck numbers in the API are 0 through 3. The page labels them Deck 1 through Deck 4.
+
+Saved matches come from serato-library-manager's Related Tracks sidecar. The listener opens it read-only and closes it before returning. The file is `related-tracks.sqlite` beside `master.sqlite`. `related_tracks.sqlite` is used when only that name is present. `SERATO_RELATED_PATH` replaces either one. A missing file, a database that is not the sidecar, or a file that cannot be read leaves saved matches empty and still returns suggestions.
+
+The canonical table, until `docs/related-tracks.md` in that repository names the final schema, is:
+
+```sql
+CREATE TABLE related_track (
+  id INTEGER PRIMARY KEY,
+  asset_id INTEGER,
+  related_asset_id INTEGER,
+  portable_id TEXT,
+  related_portable_id TEXT,
+  note TEXT,
+  position INTEGER
+);
+```
+
+A row matches in either direction. `position` orders saved matches. `src/library/related-store.ts` is the only module that reads this file. It also accepts `related_tracks`, `track_relation` (`left_asset_id`, `right_asset_id`), and a few other nearby names.
+
+Suggestions come from `master.sqlite`. A suggestion has a compatible Camelot key (the same key, one step around the wheel, or the relative major or minor) and a BPM within 6% of the playing track. Half-time and double-time count. Quadruple time does not. Tracks that share a crate rank above the same musical match with no shared crate. Tracks loaded on the other decks are left out. Saved matches are listed first. The list is capped at 10.
+
+Open `http://127.0.0.1:8787/` while Serato is playing. The page subscribes to `/events` and updates each deck.
 
 ## MIDI
 
@@ -83,8 +111,8 @@ The same binary also stores FX, sampler, and hardware status addresses that this
 npm test
 ```
 
-The suite builds a temporary database and temporary ID3 bytes. It does not open a live Serato library, publish a Bonjour advert, or compile or spawn the MIDI helper.
+The suite builds a temporary database, a temporary related-tracks sidecar, and temporary ID3 bytes. It does not open a live Serato library, publish a Bonjour advert, or compile or spawn the MIDI helper.
 
 ## Layout
 
-`src/live.ts` is the OSC codec and the deck session. `src/server.ts` is HTTP, the TCP listener, and `dns-sd`. `src/midi.ts` parses MIDI and spawns the helper. `src/midi-listen.swift` is that CoreMIDI client. `src/library/` reads and edits the SQLite library and the Markers2 / BeatGrid tags. `npm run build` compiles the TypeScript to `dist/`. `node dist/server.js` is what `npm start` runs, and on macOS it compiles the Swift helper into `dist/` on startup.
+`src/live.ts` is the OSC codec and the deck session. `src/server.ts` is HTTP, the TCP listener, and `dns-sd`. `src/live-page.ts` is the related-tracks page. `src/midi.ts` parses MIDI and spawns the helper. `src/midi-listen.swift` is that CoreMIDI client. `src/library/` reads and edits the SQLite library and the Markers2 / BeatGrid tags. `src/library/related.ts` ranks matches. `src/library/related-store.ts` reads the sidecar. `npm run build` compiles the TypeScript to `dist/`. `node dist/server.js` is what `npm start` runs, and on macOS it compiles the Swift helper into `dist/` on startup.
