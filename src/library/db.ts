@@ -578,6 +578,24 @@ function seratoStrNorm(value: SQLOutputValue): string | null {
 }
 
 /**
+ * Maps a Camelot or traditional key name to Serato's integer key.
+ * Minor Camelot keys `1A` through `12A` are 0 through 11. Major keys
+ * `1B` through `12B` are 12 through 23. Traditional names share those numbers.
+ *
+ * @param key A key name such as `8A`, `Am`, or `F#m`.
+ * @returns The integer key, or null when the name is empty or unknown.
+ *
+ * Side effects: none.
+ */
+export function libraryKeyType(key: string | null | undefined): number | null {
+  if (key == null) return null;
+  const text = String(key).trim().toLowerCase();
+  if (!text) return null;
+  const value = KEY_VALUES[text];
+  return value == null ? null : value;
+}
+
+/**
  * Maps a key name to Serato's integer key type.
  *
  * @param value A Camelot or traditional key, or null.
@@ -587,9 +605,8 @@ function seratoStrNorm(value: SQLOutputValue): string | null {
  */
 function seratoKeyType(value: SQLOutputValue): number {
   if (value == null) return -1;
-  const text = String(value).trim().toLowerCase();
-  if (!text) return -1;
-  return KEY_VALUES[text] ?? -1;
+  const parsed = libraryKeyType(String(value));
+  return parsed == null ? -1 : parsed;
 }
 
 /**

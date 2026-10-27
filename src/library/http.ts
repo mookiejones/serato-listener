@@ -2,7 +2,8 @@
  * JSON routes for the Serato library.
  *
  * `GET /api/library` lists tracks and crates. `GET /api/crates` lists crates.
- * `POST /api/crates` runs a crate action. `GET /api/tracks/:id/tags` reads
+ * `POST /api/crates` runs a crate action. `GET /api/related` lists saved and
+ * suggested tracks for one deck or one file path. `GET /api/tracks/:id/tags` reads
  * cue, loop, flip, and beatgrid frames from the audio file. Writes require
  * the `X-Serato-Listener` header so a page on another site cannot post to
  * this process. The OSC stream is not touched here; the caller passes the
@@ -13,6 +14,7 @@ import type { IncomingMessage } from 'node:http';
 import { LibraryError, SeratoOpen } from './errors';
 import { crateAction } from './crates';
 import { loadLibrary, resolvePortable, trackFile, type PlayingDeckInput } from './db';
+import { relatedForDeck, relatedForPath } from './related';
 import { markersFor } from './tags';
 
 const BODY_LIMIT = 2_000_000;
@@ -170,6 +172,19 @@ async function dispatch(input: {
     }
     const result = await crateAction(input.body as Record<string, unknown>);
     return { status: 200, body: result };
+  }
+  if (input.pathname === '/api/related') {
+    if (method !== 'GET') return { status: 405, body: { error: 'That method is not available here.' } };
+    const filePath = input.searchParams.get('path')?.trim() || '';
+    if (filePath) return { status: 200, body: relatedForPath(input.decks || [], filePath) };
+    const deckText = input.searchParams.get('deck');
+    if (deckText != null && deckText !== '') {
+      if (!/^\d+$/.test(deckText) || Number(deckText) > 3) {
+        return { status: 400, body: { error: 'Pick a deck from 0 to 3.' } };
+      }
+      return { status: 200, body: relatedForDeck(input.decks || [], Number(deckText)) };
+    }
+    return { status: 400, body: { error: 'Pass a deck or a file path.' } };
   }
   const tags = input.pathname.match(/^\/api\/tracks\/(\d+)\/tags$/);
   if (tags) {

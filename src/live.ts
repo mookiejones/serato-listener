@@ -450,6 +450,16 @@ export class LiveSession {
   /** Called when a pair or connection change should reach the browser feed immediately. */
   onUpdate: ((payload: unknown) => void) | null = null;
 
+  /**
+   * Called when a deck's loaded track changes.
+   * Title, artist, file path, and the loaded flag each count. Playhead
+   * movement does not. The HTTP server publishes related tracks from here.
+   */
+  onDeckTrack: ((deck: number) => void) | null = null;
+
+  /** Last title, artist, file path, and loaded flag sent to `onDeckTrack`, per deck. */
+  private trackIdentity = ['', '', '', ''];
+
   private readonly history: LiveEvent[] = [];
   private readonly pending: LiveEvent[] = [];
   private statusWriter: FrameWriter | null = null;
@@ -652,7 +662,7 @@ export class LiveSession {
    *
    * @param msg One status message from the writer that owns the status stream.
    *
-   * Side effects: updates faders, tracks, and the event queue.
+   * Side effects: updates faders, tracks, and the event queue. A loaded-track change also calls `onDeckTrack`.
    */
   private handleStatus(msg: OscMessage): void {
     const { address, args } = msg;
@@ -707,6 +717,7 @@ export class LiveSession {
         artist: this.state.tracks[deck].artist,
       });
       this.logLine(`deck ${deck + 1} title set`);
+      this.deckTrackChanged(deck);
       return;
     }
     if (address === '/Status/Deck/Song/Artist') {
@@ -717,20 +728,39 @@ export class LiveSession {
         title: this.state.tracks[deck].title,
         artist: this.state.tracks[deck].artist,
       });
+      this.deckTrackChanged(deck);
       return;
     }
     if (address === '/Status/Deck/Song/Filepath') {
       this.state.tracks[deck].filepath = argString(args, 1);
       this.noteExtra(msg);
       this.logLine(`deck ${deck + 1} file set`);
+      this.deckTrackChanged(deck);
       return;
     }
     if (address === '/Status/Deck/Song/Valid') {
       this.state.tracks[deck].valid = argFloat(args, 1) ?? undefined;
       this.noteExtra(msg);
+      this.deckTrackChanged(deck);
       return;
     }
     this.noteExtra(msg);
+  }
+
+  /**
+   * Notifies the HTTP server when the loaded track on one deck changed.
+   * A repeated title or file path for the same deck does not notify again.
+   *
+   * @param deck Deck index from 0 through 3.
+   *
+   * Side effects: calls `onDeckTrack` when the identity changed and a listener is set.
+   */
+  private deckTrackChanged(deck: number): void {
+    const track = this.state.tracks[deck];
+    const identity = `${track.filepath ?? ''}\0${track.title}\0${track.artist}\0${track.valid ?? ''}`;
+    if (this.trackIdentity[deck] === identity) return;
+    this.trackIdentity[deck] = identity;
+    this.onDeckTrack?.(deck);
   }
 
   /**
