@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>iPhone remote status map</title>
+  <style>
+    :root {
+      --paper: #e3eaee;
+      --sheet: #f4f7f8;
+      --ink: #17212b;
+      --mute: #5d6c78;
+      --rule: #c5d0d6;
+      --live: #1d4e3a;
+      --open: #b42318;
+    }
+
+    * { box-sizing: border-box; }
+
+    html { background: var(--paper); }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      font-family: "Iowan Old Style", Palatino, "Palatino Linotype", Georgia, serif;
+      font-size: 18px;
+      line-height: 1.45;
+    }
+
+    main {
+      max-width: 1040px;
+      margin: 0 auto;
+      padding: 48px 28px 72px;
+    }
+
+    header { max-width: 38rem; }
+
+    .version {
+      margin: 0 0 10px;
+      font-family: "Avenir Next Condensed", "Avenir Next", "Segoe UI", sans-serif;
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: 0.01em;
+      color: var(--mute);
+    }
+
+    h1 {
+      margin: 0;
+      font-family: "Avenir Next Condensed", "Avenir Next", "Segoe UI", sans-serif;
+      font-size: clamp(36px, 8vw, 64px);
+      font-weight: 700;
+      line-height: 0.92;
+      letter-spacing: -0.02em;
+    }
+
+    .lede {
+      margin: 18px 0 0;
+      max-width: 36rem;
+    }
+
+    .map {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 36px;
+      margin-top: 40px;
+      align-items: start;
+    }
+
+    .column {
+      background: var(--sheet);
+      padding: 22px 22px 8px;
+      border-top: 8px solid var(--live);
+    }
+
+    .column.open { border-top-color: var(--open); }
+
+    .column h2 {
+      margin: 0 0 18px;
+      font-family: "Avenir Next Condensed", "Avenir Next", "Segoe UI", sans-serif;
+      font-size: 28px;
+      font-weight: 700;
+      line-height: 1;
+    }
+
+    .column h2 span {
+      display: block;
+      margin-top: 6px;
+      font-family: "Iowan Old Style", Palatino, Georgia, serif;
+      font-size: 16px;
+      font-weight: 400;
+      color: var(--mute);
+    }
+
+    .group { margin: 0 0 18px; }
+
+    .group h3 {
+      margin: 0 0 6px;
+      padding-top: 10px;
+      border-top: 1px solid var(--rule);
+      font-family: "Avenir Next Condensed", "Avenir Next", "Segoe UI", sans-serif;
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--mute);
+    }
+
+    .group:first-of-type h3 {
+      border-top: 0;
+      padding-top: 0;
+    }
+
+    ul {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+    }
+
+    li {
+      display: flex;
+      gap: 10px;
+      align-items: baseline;
+      margin: 0 0 4px;
+    }
+
+    li::before {
+      content: "";
+      flex: 0 0 8px;
+      width: 8px;
+      height: 8px;
+      margin-top: 5px;
+      background: var(--live);
+    }
+
+    .open li::before { background: var(--open); }
+
+    code {
+      font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+      font-size: 13px;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
+    }
+
+    .notes {
+      display: grid;
+      grid-template-columns: 1.2fr 1fr 1fr;
+      gap: 28px;
+      margin-top: 36px;
+      padding-top: 22px;
+      border-top: 1px solid var(--rule);
+      max-width: 1040px;
+    }
+
+    .notes p { margin: 0; }
+
+    .notes strong {
+      font-family: "Avenir Next Condensed", "Avenir Next", "Segoe UI", sans-serif;
+      font-weight: 700;
+    }
+
+    code.inline {
+      font-size: 0.86em;
+    }
+
+    @media (max-width: 800px) {
+      .map, .notes { grid-template-columns: 1fr; }
+      main { padding: 28px 16px 48px; }
+    }
+
+    @media print {
+      html { background: white; }
+      body { font-size: 12px; }
+      main { padding: 0; max-width: none; }
+      .column { break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="version">Serato DJ Pro 5.0.0.1251, arm64 and x86_64</p>
+      <h1>iPhone remote status map</h1>
+      <p class="lede">The app stores 35 fixed status addresses in one table next to <code class="inline">/Register/</code> and <code class="inline">/Deregister/</code>. This listener subscribes to 16 of them. The other 19 stay in the binary until something registers them.</p>
+    </header>
+
+    <div class="map">
+      <section class="column" aria-labelledby="subscribed">
+        <h2 id="subscribed">Subscribed <span>16 addresses in TOPICS</span></h2>
+
+        <div class="group">
+          <h3>Deck</h3>
+          <ul>
+            <li><code>Status/Deck/Playhead</code></li>
+          </ul>
+        </div>
+        <div class="group">
+          <h3>Song</h3>
+          <ul>
+            <li><code>Status/Deck/Song/Title</code></li>
+            <li><code>Status/Deck/Song/Artist</code></li>
+            <li><code>Status/Deck/Song/Filepath</code></li>
+            <li><code>Status/Deck/Song/Valid</code></li>
+          </ul>
+        </div>
+        <div class="group">
+          <h3>Loop</h3>
+          <ul>
+            <li><code>Status/Deck/Loop/AutoLoopOn</code></li>
+            <li><code>Status/Deck/Loop/BeatLength</code></li>
+            <li><code>Status/Deck/Loop/LoopRollOn</code></li>
+            <li><code>Status/Deck/Loop/LoopInOutPoint</code></li>
+            <li><code>Status/Deck/Loop/ManualLoopIn</code></li>
+            <li><code>Status/Deck/Loop/ManualLoopOut</code></li>
+            <li><code>Status/Deck/Loop/ManualLoopOn</code></li>
+            <li><code>Status/Deck/Loop/ManualLoopSetting</code></li>
+          </ul>
+        </div>
+        <div class="group">
+          <h3>Slicer</h3>
+          <ul>
+            <li><code>Status/Deck/Slicer/Loop</code></li>
+          </ul>
+        </div>
+        <div class="group">
+          <h3>Faders</h3>
+          <ul>
+            <li><code>Status/Video/Deck/Mixer/Upfader</code></li>
+            <li><code>Status/Video/Mixer/Crossfader</code></li>
+          </ul>
+        </div>
+      </section>
+
+      <section class="column open" aria-labelledby="open">
+        <h2 id="open">In the binary <span>19 addresses this listener does not register</span></h2>
+
+        <div class="group">
+          <h3>FX slot</h3>
+          <ul>
+            <li><code>Status/FX/Slot/BeatsIndex</code></li>
+            <li><code>Status/FX/Slot/DeckAssign</code></li>
+            <li><code>Status/FX/Slot/Effect</code></li>
+            <li><code>Status/FX/Slot/Enabled</code></li>
+            <li><code>Status/FX/Slot/Mode</code></li>
+            <li><code>Status/FX/Slot/Value</code></li>
+          </ul>
+        </div>
+        <div class="group">
+          <h3>Multi FX</h3>
+          <ul>
+            <li><code>Status/MultiFX/Beats</code></li>
+            <li><code>Status/MultiFX/List</code></li>
+          </ul>
+        </div>
+        <div class="group">
+          <h3>Single FX</h3>
+          <ul>
+            <li><code>Status/SingleFX/Beats</code></li>
+            <li><code>Status/SingleFX/List</code></li>
+          </ul>
+        </div>
+        <div class="group">
+          <h3>Sampler</h3>
+          <ul>
+            <li><code>Status/Sampler/Bank</code></li>
+            <li><code>Status/Sampler/Level</code></li>
+            <li><code>Status/Sampler/LoopState</code></li>
+            <li><code>Status/Sampler/MasterLevel</code></li>
+            <li><code>Status/Sampler/Name</code></li>
+            <li><code>Status/Sampler/PlayMode</code></li>
+            <li><code>Status/Sampler/PlayState</code></li>
+            <li><code>Status/Sampler/Valid</code></li>
+          </ul>
+        </div>
+        <div class="group">
+          <h3>Hardware</h3>
+          <ul>
+            <li><code>Status/Hardware/Connected</code></li>
+          </ul>
+        </div>
+      </section>
+    </div>
+
+    <section class="notes">
+      <p><strong>How a subscription is sent.</strong> The strings in the binary have no leading slash. The listener sends <code class="inline">/Register/</code> plus the path, the same way it already sends <code class="inline">/Register/Status/Deck/Playhead</code>. Until one of the open addresses is registered, Serato does not push it, so it cannot arrive as an <code class="inline">ex</code> event.</p>
+      <p><strong>ACI is a separate family.</strong> <code class="inline">/Status/ACI/</code> and <code class="inline">/Control/ACI/</code> take an id. Those ids are packed in <code class="inline">userio_resources.bin</code>, not stored as OSC paths.</p>
+      <p><strong>Unsubscribe and control.</strong> <code class="inline">/Deregister/</code> is the matching unsubscribe prefix. The binary has no fixed <code class="inline">/Control/Deck/…</code> strings. This process does not send <code class="inline">/Control/</code> messages.</p>
+    </section>
+  </main>
+</body>
+</html>

@@ -60,6 +60,8 @@ Serato is the TCP client. This process is the server. The 16-byte sentinel and t
 
 Registered topics are playhead, title, artist, file path, the loaded flag, upfader, crossfader, the loop addresses, and the slicer loop. Other `/Status/` addresses are forwarded on the event feed as `ex` events. This process does not send `/Control/` messages.
 
+The same binary also stores FX, sampler, and hardware status addresses that this process does not register. The full table is drawn in [docs/iphone-remote-channels.html](docs/iphone-remote-channels.html).
+
 ## Tests
 
 ```sh
