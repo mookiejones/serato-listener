@@ -1,3 +1,5 @@
+import pc from "picocolors";
+
 /**
  * Terminal log for the listener.
  *
@@ -12,8 +14,11 @@
  *
  * Side effects: writes to stdout.
  */
-export function logInfo(text: string): void {
-  console.log(text);
+export function logInfo(text:string): void {
+  console.log(
+    `${pc.bgBlue(pc.white(pc.italic(Date.now())))} ${text}`
+  )
+
 }
 
 /**
@@ -24,5 +29,5 @@ export function logInfo(text: string): void {
  * Side effects: writes to stderr.
  */
 export function logError(text: string): void {
-  console.error(text);
+  console.error(pc.red(text));
 }

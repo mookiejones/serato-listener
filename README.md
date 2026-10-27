@@ -6,7 +6,7 @@ The live side speaks OSC. Serato browses for `_SeratoIOSRemote._tcp`, connects, 
 
 ## Run
 
-Node 22.13 or newer. `node:sqlite` is still marked experimental, so the process prints one warning the first time it opens a database. No extra flag is required.
+Node 22.13 or newer. `node:sqlite` is still marked experimental, so the process prints one warning the first time it opens a database. No extra flag is required. Info lines include a blue timestamp. Error lines are red.
 
 ```sh
 npm install
